@@ -251,10 +251,6 @@ Generate multiple plot types in a single session:
 
 [Add your license information here]
 
-## Contributing
-
-[Add contribution guidelines here]
-
 ## Contact
 
-[Add contact information here]
+If you have any questions or suggestions for improvement, feel free to reach out at clarencehlyeung at gmail dot com.
