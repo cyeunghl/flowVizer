@@ -1,18 +1,44 @@
-# flowVizer
+# flowViz
 
-Python-based script to plot FlowJo workspace (.wsp) files in a 96-well plate layout with interactive HTML visualizations.
+Python-based tools for FlowJo workspace analysis with interactive HTML visualizations and automated batch processing.
 
 ## Overview
 
-flowVizer analyzes FlowJo workspaces and associated FCS files to generate interactive HTML plots organized in a 96-well plate grid. It leverages `flowkit` for parsing flow cytometry data and `bokeh` for creating interactive visualizations. All visualizations use raw (untransformed) data values for accuracy.
+flowViz analyzes FlowJo workspaces and associated FCS files to generate interactive HTML plots organized in a 96-well plate grid. It leverages `flowkit` for parsing flow cytometry data and `bokeh` for creating interactive visualizations. All visualizations use raw (untransformed) data values for accuracy.
+
+**Two modes of operation:**
+1. **Interactive Mode** (`analyze_flow.py`): CLI-guided plot generation with manual configuration
+2. **Batch Mode** (`batch_analyze_flow.py`): Automated processing for time series, dose-response, and replicate analysis
+
+## Quick Start
+
+**For automated batch processing** (recommended for experiments with multiple conditions):
+```bash
+# See QUICKSTART.md for 5-minute setup guide
+python batch_analyze_flow.py
+```
+
+**For manual/exploratory analysis:**
+```bash
+python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --interactive
+```
+
+## Documentation
+
+- **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes with batch processing
+- **[README_BATCH.md](README_BATCH.md)** - Comprehensive batch processing guide
+- **README.md** (this file) - Interactive mode documentation
 
 ## Features
 
+- **Automated Batch Processing**: Process multiple experimental conditions without manual intervention (NEW!)
+- **Time Series Analysis**: Iterate over time points, treatments, or other experimental variables (NEW!)
+- **Multi-Gate Visualization**: Display multiple gates with distinct colors and global legend (NEW!)
 - **Batch Plot Generation**: Generate histograms or scatter plots across all samples in a workspace
 - **96-Well Plate Layout**: Automatically organizes plots in a 8×12 grid matching plate positions
 - **Interactive HTML Output**: Pan, zoom, and explore plots in your web browser
 - **Flexible Well ID Extraction**: Auto-detect well IDs from keywords, filenames, or manual selection
-- **Gate Visualization**: Display gate boundaries on scatter plots with olive green polygons
+- **Gate Visualization**: Display gate boundaries on scatter plots with distinct colors
 - **Multiple Plot Types**:
   - **Histograms**: Density plots (KDE) with linear or log scale
   - **Scatter Plots**: 2D parameter visualization with optional gate overlays
@@ -251,6 +277,10 @@ Generate multiple plot types in a single session:
 
 [Add your license information here]
 
+## Contributing
+
+[Add contribution guidelines here]
+
 ## Contact
 
-If you have any questions or suggestions for improvement, feel free to reach out at clarencehlyeung at gmail dot com.
+[Add contact information here]

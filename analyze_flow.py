@@ -438,8 +438,41 @@ class FlowAnalyzer:
                         if hasattr(gate, 'vertices'):
                             # Polygon gate
                             verts = np.array(gate.vertices)
-                            xs = verts[:, 0].tolist()
-                            ys = verts[:, 1].tolist()
+
+                            # Gate vertices are in transformed space, convert to raw data coordinates
+                            try:
+                                # Get the transforms from the workspace
+                                x_transform = self.workspace.get_transform(sample_id, dims[0])
+                                y_transform = self.workspace.get_transform(sample_id, dims[1])
+
+                                print(f"    DEBUG (_extract_gate_polygons): Gate '{gate_name}'")
+                                print(f"           Original verts range: X=[{verts[:, 0].min():.4f}, {verts[:, 0].max():.4f}], Y=[{verts[:, 1].min():.4f}, {verts[:, 1].max():.4f}]")
+                                print(f"           X transform: {x_transform}")
+                                print(f"           Y transform: {y_transform}")
+
+                                # Gate vertices are in DISPLAY SPACE (0-1 normalized over visible range)
+                                # NOT in transform space! We need to map to the display range.
+                                # FlowJo typically displays log scale from 10^0 to 10^5 (1 to 100,000)
+
+                                # Map from display space (0-1) to raw values
+                                display_min_log = 0  # log10(1)
+                                display_max_log = 5  # log10(100000)
+
+                                # Convert normalized display coordinates to log space, then to linear
+                                xs = (10 ** (display_min_log + verts[:, 0] * (display_max_log - display_min_log))).tolist()
+                                ys = (10 ** (display_min_log + verts[:, 1] * (display_max_log - display_min_log))).tolist()
+
+                                print(f"           Mapped from display space (0-1) to raw values")
+                                print(f"           X: [{min(xs):.2f}, {max(xs):.2f}]")
+                                print(f"           Y: [{min(ys):.2f}, {max(ys):.2f}]")
+                            except Exception as e:
+                                print(f"    DEBUG: Transform failed: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                # Fall back to original vertices
+                                xs = verts[:, 0].tolist()
+                                ys = verts[:, 1].tolist()
+
                             # Close the loop
                             xs.append(xs[0])
                             ys.append(ys[0])
@@ -487,8 +520,9 @@ class FlowAnalyzer:
                                 'xs': xs,
                                 'ys': ys
                             })
-            except Exception:
-                pass
+            except Exception as e:
+                # Log error but continue processing other gates
+                print(f"    Warning: Could not extract gate '{gate_name}' for channels {x_channel}, {y_channel}: {e}")
         return gates_data
 
     def _extract_selected_gate(self, sample_id, gate_name, gate_path, x_channel, y_channel):
@@ -514,18 +548,25 @@ class FlowAnalyzer:
             # Handle "Ungated" case
             if gate_name == "Ungated":
                 return None
-            
-            gate = self.workspace.get_gate(sample_id, gate_name, gate_path=gate_path[:-1] if len(gate_path) > 1 else ())
-            
+
+            # Get the gate using the parent path
+            get_gate_path = gate_path[:-1] if len(gate_path) > 1 else ()
+            print(f"    DEBUG: Getting gate '{gate_name}' with gate_path={get_gate_path}")
+            gate = self.workspace.get_gate(sample_id, gate_name, gate_path=get_gate_path)
+
             # Check if gate is 2D and matches our channels
             if len(gate.dimensions) != 2:
+                print(f"    DEBUG: Gate is {len(gate.dimensions)}D, not 2D")
                 return None
-            
+
             dims = [d.id for d in gate.dimensions]  # Channel names
-            
+            print(f"    DEBUG: Gate dimensions: {dims}")
+            print(f"    DEBUG: Expected channels: [{x_channel}, {y_channel}]")
+
             # Check if gate matches our axes (in either order)
-            if not ((dims[0] == x_channel and dims[1] == y_channel) or 
+            if not ((dims[0] == x_channel and dims[1] == y_channel) or
                    (dims[0] == y_channel and dims[1] == x_channel)):
+                print(f"    DEBUG: Channel mismatch!")
                 return None
             
             # Get vertices
@@ -535,8 +576,44 @@ class FlowAnalyzer:
             if hasattr(gate, 'vertices'):
                 # Polygon gate
                 verts = np.array(gate.vertices)
-                xs = verts[:, 0].tolist()
-                ys = verts[:, 1].tolist()
+
+                # Gate vertices are in transformed space, but we need raw data coordinates
+                # Get the sample to access transforms
+                sample = self.workspace.get_sample(sample_id)
+
+                # Get transforms for the channels
+                try:
+                    # Apply inverse transform to convert from display coordinates to raw values
+                    # The vertices are in transformed/display space (0-1 or similar)
+                    # We need to convert them to raw data space
+
+                    # Get channel indices
+                    x_channel_idx = sample.pnn_labels.index(dims[0])
+                    y_channel_idx = sample.pnn_labels.index(dims[1])
+
+                    # Gate vertices are in DISPLAY SPACE (0-1 normalized over visible range)
+                    # NOT in transform space! We need to map to the display range.
+                    # FlowJo typically displays log scale from 10^0 to 10^5 (1 to 100,000)
+
+                    # Map from display space (0-1) to raw values
+                    display_min_log = 0  # log10(1)
+                    display_max_log = 5  # log10(100000)
+
+                    # Convert normalized display coordinates to log space, then to linear
+                    xs = (10 ** (display_min_log + verts[:, 0] * (display_max_log - display_min_log))).tolist()
+                    ys = (10 ** (display_min_log + verts[:, 1] * (display_max_log - display_min_log))).tolist()
+
+                    print(f"    DEBUG: Mapped gate from display space to raw values")
+                    print(f"           X: [{min(xs):.2f}, {max(xs):.2f}]")
+                    print(f"           Y: [{min(ys):.2f}, {max(ys):.2f}]")
+                except Exception as e:
+                    print(f"    DEBUG: Could not apply inverse transform: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Fall back to original vertices
+                    xs = verts[:, 0].tolist()
+                    ys = verts[:, 1].tolist()
+
                 # Close the loop
                 xs.append(xs[0])
                 ys.append(ys[0])
@@ -576,6 +653,19 @@ class FlowAnalyzer:
                     pass
             
             if xs and ys:
+                # Validate coordinates before returning
+                if len(xs) != len(ys):
+                    print(f"    ⚠️  Warning: Gate '{gate_name}' has mismatched coordinates (xs={len(xs)}, ys={len(ys)})")
+                    return None
+                if len(xs) < 3:
+                    print(f"    ⚠️  Warning: Gate '{gate_name}' has insufficient points ({len(xs)} < 3)")
+                    return None
+
+                # Show coordinate ranges for debugging
+                print(f"    DEBUG: Gate '{gate_name}' coordinates:")
+                print(f"           X range: [{min(xs):.2f}, {max(xs):.2f}]")
+                print(f"           Y range: [{min(ys):.2f}, {max(ys):.2f}]")
+
                 return {
                     'name': gate_name,
                     'x_dim': dims[0],
@@ -583,9 +673,9 @@ class FlowAnalyzer:
                     'xs': xs,
                     'ys': ys
                 }
-        except Exception:
-            pass
-        
+        except Exception as e:
+            print(f"    ⚠️  Warning: Could not extract gate '{gate_name}': {e}")
+
         return None
 
     def interactive_plot_prompt(self):
@@ -1278,27 +1368,50 @@ class FlowAnalyzer:
                 except Exception as e:
                     pass  # Will show empty list
                 
+                # Store which gates to visualize
+                gates_to_visualize = []
+
                 if available_gates:
                     print(f"\nAvailable gates for channels {x_channel} / {y_channel}:")
                     for i, gate_name in enumerate(available_gates, 1):
                         print(f"  {i}. {gate_name}")
+
+                    print("\nYou can visualize gate boundaries on this scatter plot.")
+                    print("This is useful to see gates overlaid on Ungated populations.")
+
+                    while True:
+                        gate_viz_choice = input("\nSelect gates to visualize (comma-separated numbers, 'all', or 'none'): ").strip().lower()
+
+                        if gate_viz_choice in ['none', 'no', 'n', '']:
+                            plot_config_show_gates = False
+                            break
+                        elif gate_viz_choice in ['all', 'yes', 'y']:
+                            plot_config_show_gates = True
+                            gates_to_visualize = available_gates
+                            print(f"Will visualize: {', '.join(gates_to_visualize)}")
+                            break
+                        else:
+                            # Parse comma-separated numbers
+                            try:
+                                indices = [int(x.strip()) - 1 for x in gate_viz_choice.split(',')]
+                                selected_gates = []
+                                for idx in indices:
+                                    if 0 <= idx < len(available_gates):
+                                        selected_gates.append(available_gates[idx])
+
+                                if selected_gates:
+                                    plot_config_show_gates = True
+                                    gates_to_visualize = selected_gates
+                                    print(f"Will visualize: {', '.join(gates_to_visualize)}")
+                                    break
+                                else:
+                                    print(f"Please enter valid numbers between 1 and {len(available_gates)}")
+                            except ValueError:
+                                print("Please enter comma-separated numbers (e.g., '1,2'), 'all', or 'none'")
                 else:
                     print(f"\nNo gates found for channels {x_channel} / {y_channel}.")
                     print("Gate visualization will not be available for this plot configuration.")
-                
-                while True:
-                    show_gates_choice = input("\nShow gates on this scatter plot? (yes/no, default=no): ").strip().lower()
-                    if not show_gates_choice:
-                        plot_config_show_gates = False
-                        break
-                    elif show_gates_choice in ['yes', 'y']:
-                        plot_config_show_gates = True
-                        break
-                    elif show_gates_choice in ['no', 'n']:
-                        plot_config_show_gates = False
-                        break
-                    else:
-                        print("Please enter 'yes' or 'no'")
+                    plot_config_show_gates = False
             
             # Create plot configuration
             plot_config = {
@@ -1316,7 +1429,11 @@ class FlowAnalyzer:
                     plot_config['scale'] = scale_choice
                 plot_config['show_gates'] = False  # Gates not applicable for histograms
             else:  # scatter
-                plot_config['show_gates'] = plot_config_show_gates if 'plot_config_show_gates' in locals() else False
+                # Use explicit check for scatter plot type instead of unreliable locals() check
+                plot_config['show_gates'] = plot_config_show_gates
+                # Store which specific gates to visualize
+                if 'gates_to_visualize' in locals() and gates_to_visualize:
+                    plot_config['gates_to_visualize'] = gates_to_visualize
             
             plot_configs.append(plot_config)
         
@@ -1624,46 +1741,49 @@ class FlowAnalyzer:
         x_channel = x_channels[0]
         y_channel = y_channels[0]
         
+        # Filter out values <= 0 for log scale (log can't handle 0 or negative values)
+        df = df[(df[x_channel] > 0) & (df[y_channel] > 0)]
+
         # Downsample if too many points for performance
         max_points = 10000
         if len(df) > max_points:
             df_plot = df.sample(n=max_points, random_state=42)
         else:
             df_plot = df
-        
+
         # Convert to ColumnDataSource for Bokeh
         from bokeh.models import ColumnDataSource
         source = ColumnDataSource(df_plot)
-        
+
+        # Use log scale for both axes to match FlowJo display
+        # Set fixed ranges: 1 to 10^5 (matching FlowJo's typical range)
         p = figure(title=f"{sample_id} - {gate_name}",
                    x_axis_label=x_channel, y_axis_label=y_channel,
+                   x_axis_type="log", y_axis_type="log",
+                   x_range=(1, 1e5), y_range=(1, 1e5),
                    width=400, height=300, tools="pan,wheel_zoom,box_zoom,reset,save",
                    sizing_mode="fixed")
+
         p.scatter(x=x_channel, y=y_channel, source=source, size=2, alpha=0.6, color="navy")
-        
-        # Plot the selected gate (the one used for filtering) if available
-        if selected_gate:
-            xs = selected_gate.get('xs', [])
-            ys = selected_gate.get('ys', [])
-            if xs and ys and len(xs) == len(ys) and len(xs) >= 3:
-                # Check if dimensions need to be swapped
-                if selected_gate.get('x_dim') == y_channel:
-                    xs, ys = ys, xs
-                # Ensure polygon is closed (first point = last point)
-                if xs[0] != xs[-1] or ys[0] != ys[-1]:
-                    xs = list(xs) + [xs[0]]
-                    ys = list(ys) + [ys[0]]
-                # Plot selected gate as filled polygon with olive green (same as histogram)
-                p.patch(xs, ys, fill_color="#6B8E23", fill_alpha=0.3, line_color="#556B2F", 
-                       line_width=2.5, line_alpha=0.9, legend_label=selected_gate.get('name', 'Selected Gate'))
-        
-        # Add additional gate visualization if requested (all matching gates)
+
+        # Render gate boundaries if requested
         if show_gates and gates:
+            print(f"    → Rendering {len(gates)} gate(s) on log scale (1 to 10^5)")
+
+            # Color palette for gates (distinct colors/shades)
+            gate_colors = [
+                ("#6B8E23", "#556B2F"),  # Olive green
+                ("#4682B4", "#36648B"),  # Steel blue
+                ("#CD853F", "#8B5A2B"),  # Peru/tan
+                ("#9370DB", "#7B68EE"),  # Medium purple
+                ("#DC143C", "#B22222"),  # Crimson
+                ("#20B2AA", "#008B8B"),  # Light sea green
+                ("#FF8C00", "#CD6600"),  # Dark orange
+                ("#8B4789", "#68387E"),  # Dark orchid
+            ]
+
             # gates should be a list of gate dictionaries with 'name', 'x_dim', 'y_dim', 'xs', 'ys'
-            for gate in gates:
-                # Skip if this is the selected gate (already plotted above)
-                if selected_gate and gate.get('name') == selected_gate.get('name'):
-                    continue
+            for gate_idx, gate in enumerate(gates):
                 # Check if gate matches current axes
                 if (gate.get('x_dim') == x_channel and gate.get('y_dim') == y_channel) or \
                    (gate.get('x_dim') == y_channel and gate.get('y_dim') == x_channel):
@@ -1673,13 +1793,29 @@ class FlowAnalyzer:
                         # Swap if dimensions are reversed
                         if gate.get('x_dim') == y_channel:
                             xs, ys = ys, xs
+
+                        print(f"      DEBUG: Gate '{gate.get('name')}' coordinates:")
+                        print(f"             X: [{min(xs):.2f}, {max(xs):.2f}]")
+                        print(f"             Y: [{min(ys):.2f}, {max(ys):.2f}]")
+
                         # Ensure polygon is closed
                         if xs[0] != xs[-1] or ys[0] != ys[-1]:
                             xs = list(xs) + [xs[0]]
                             ys = list(ys) + [ys[0]]
-                        # Plot additional gates with olive green but lighter fill
-                        p.patch(xs, ys, fill_color="#6B8E23", fill_alpha=0.2, line_color="#556B2F", 
-                               line_width=2, line_alpha=0.8, legend_label=gate.get('name', 'Gate'))
+
+                        # Get color for this gate
+                        fill_color, line_color = gate_colors[gate_idx % len(gate_colors)]
+
+                        # Plot gates with distinct colors (no legend_label - will add global legend)
+                        # Gates are already in raw data space from inverse transform
+                        # They will be displayed correctly on log-scale axes
+                        p.patch(xs, ys, fill_color=fill_color, fill_alpha=0.3, line_color=line_color,
+                               line_width=2.5, line_alpha=0.9)
+                        print(f"      ✓ Rendered '{gate.get('name')}' ({len(xs)} vertices, color: {fill_color})")
+                    else:
+                        print(f"      ⚠️  Skipped '{gate.get('name')}': invalid coordinates")
+                else:
+                    print(f"      ⚠️  Skipped '{gate.get('name')}': channel mismatch")
         
         # Add keyword display in bottom right if requested
         if show_keywords and keywords:
@@ -1842,9 +1978,11 @@ class FlowAnalyzer:
                         print(f"    ✓ Found well ID: {r}{c:02d} (extracted from {method_used})")
                     
                     # Get gate events with raw data
-                    # Handle "Ungated" case - use get_events instead of get_gate_events
-                    print(f"    → Loading data for gate '{gate_name}'...", end=" ")
+                    # IMPORTANT: Load PRE-FILTERED data (parent gate), not the selected gate's data
+                    # This allows us to visualize the gate boundary overlaid on ungated/parent populations
+                    print(f"    → Loading PRE-FILTERED data (before '{gate_name}' gate)...", end=" ")
                     if gate_name == "Ungated" or (not gate_path or gate_path == ()):
+                        # Ungated case - use raw events
                         events = sample.get_events(source='raw')
                         if events is not None:
                             # Convert to DataFrame if needed
@@ -1854,8 +1992,40 @@ class FlowAnalyzer:
                                 df = events
                         else:
                             df = None
+                    elif gate_path == ('root',):
+                        # First-level gate (like Cells_withDebris) - parent is raw ungated data
+                        events = sample.get_events(source='raw')
+                        if events is not None:
+                            if not isinstance(events, pd.DataFrame):
+                                df = pd.DataFrame(events, columns=sample.pnn_labels)
+                            else:
+                                df = events
+                        else:
+                            df = None
                     else:
-                        df = self.workspace.get_gate_events(sample_id, gate_name, gate_path=gate_path, source="raw")
+                        # Multi-level gate - get parent gate's data
+                        parent_gate_path = gate_path[:-1]
+                        # Get the parent gate name from the workspace
+                        try:
+                            # Navigate to parent gate
+                            if parent_gate_path == ('root',):
+                                # Parent is a root-level gate, need to find it by name
+                                # For now, use raw events as fallback
+                                events = sample.get_events(source='raw')
+                                if events is not None:
+                                    if not isinstance(events, pd.DataFrame):
+                                        df = pd.DataFrame(events, columns=sample.pnn_labels)
+                                    else:
+                                        df = events
+                                else:
+                                    df = None
+                            else:
+                                # Use the parent path to get parent gate events
+                                parent_gate_name = parent_gate_path[-1]
+                                df = self.workspace.get_gate_events(sample_id, parent_gate_name, gate_path=parent_gate_path, source="raw")
+                        except Exception as e:
+                            print(f"\n    ⚠️  Could not load parent gate data: {e}")
+                            df = None
                     
                     if df is None or df.empty:
                         print("SKIPPED")
@@ -1921,8 +2091,9 @@ class FlowAnalyzer:
                             except:
                                 keywords = {}
                     
-                    # Extract selected gate for plotting (for scatter plots)
-                    selected_gate = None
+                    # Extract gates for visualization (for scatter plots)
+                    # This can be different from the gate used for filtering
+                    gates_for_viz = []
                     if plot_type == "scatter":
                         try:
                             # Find matching channels for gate extraction
@@ -1931,42 +2102,64 @@ class FlowAnalyzer:
                             if x_channels and y_channels:
                                 x_channel = x_channels[0]
                                 y_channel = y_channels[0]
-                                # Extract the selected gate (the one used for filtering)
-                                selected_gate = self._extract_selected_gate(sample_id, gate_name, gate_path, x_channel, y_channel)
+
+                                # Get list of gates to visualize from plot config
+                                gates_to_viz_list = plot_config.get('gates_to_visualize', [])
+                                show_gates = plot_config.get('show_gates', False)
+
+                                print(f"    DEBUG: show_gates={show_gates}, gates_to_visualize={gates_to_viz_list}")
+
+                                if gates_to_viz_list:
+                                    # Extract specific gates by name
+                                    print(f"    → Extracting gates for visualization: {', '.join(gates_to_viz_list)}")
+
+                                    # Check if the currently selected gate is in the visualization list
+                                    if gate_name in gates_to_viz_list and gate_name != "Ungated":
+                                        # Extract the selected gate itself
+                                        print(f"      → Attempting to extract selected gate '{gate_name}'...")
+                                        print(f"         Gate path: {gate_path}")
+                                        print(f"         X channel: '{x_channel}' (type: {type(x_channel).__name__})")
+                                        print(f"         Y channel: '{y_channel}' (type: {type(y_channel).__name__})")
+                                        selected_gate_data = self._extract_selected_gate(sample_id, gate_name, gate_path, x_channel, y_channel)
+                                        if selected_gate_data:
+                                            gates_for_viz.append(selected_gate_data)
+                                            print(f"      ✓ Extracted '{gate_name}' (selected gate, {len(selected_gate_data['xs'])} vertices)")
+                                        else:
+                                            print(f"      ⚠️  Failed to extract selected gate '{gate_name}' (returned None)")
+                                            print(f"         Check warnings above for details")
+
+                                    # Also extract any other gates from the workspace
+                                    all_gates = self._extract_gate_polygons(sample_id, x_channel, y_channel)
+                                    for gate_data in all_gates:
+                                        if gate_data['name'] in gates_to_viz_list:
+                                            # Avoid duplicates
+                                            if not any(g['name'] == gate_data['name'] for g in gates_for_viz):
+                                                gates_for_viz.append(gate_data)
+                                                print(f"      ✓ Extracted '{gate_data['name']}' ({len(gate_data['xs'])} vertices)")
+
+                                    if not gates_for_viz:
+                                        print(f"      ⚠️  Could not extract any of the requested gates")
                         except Exception as e:
-                            pass  # selected_gate will remain None
-                    
-                    # Get gates if requested (for scatter plots) - use per-plot setting
-                    gates = None
-                    plot_show_gates = plot_config.get('show_gates', False)
-                    if plot_show_gates and plot_type == "scatter":
-                        try:
-                            # Find matching channels for gate extraction
-                            x_channels = [c for c in df.columns if parameters[0] in c]
-                            y_channels = [c for c in df.columns if parameters[1] in c]
-                            if x_channels and y_channels:
-                                x_channel = x_channels[0]
-                                y_channel = y_channels[0]
-                                gates = self._extract_gate_polygons(sample_id, x_channel, y_channel)
-                        except Exception as e:
-                            print(f"    Warning: Could not extract gates: {e}")
-                            gates = None
-                    
+                            print(f"    ⚠️  Error extracting gates: {e}")
+                            gates_for_viz = []
+
                     # Generate plot based on type (pass well_id for title)
                     print(f"    → Generating {plot_type} plot...", end=" ")
                     if plot_type == "histogram":
                         # Get statistic and scale choices
                         statistic = plot_config.get('statistic', 'median')
                         scale = plot_config.get('scale', 'linear')
-                        p = self._plot_histogram(df, parameters[0], well_id, gate_name, 
+                        p = self._plot_histogram(df, parameters[0], well_id, gate_name,
                                                statistic=statistic, scale=scale,
                                                show_keywords=show_keywords, keywords=keywords)
                         # Shortened title - just well ID and gate name
                         p.title.text = f"{well_id} - {gate_name}"
                     else:  # scatter
+                        # Pass the extracted gates for visualization
+                        plot_show_gates = len(gates_for_viz) > 0
                         p = self._plot_scatter(df, parameters[0], parameters[1], well_id, gate_name,
-                                             gates=gates, show_gates=plot_show_gates,
-                                             selected_gate=selected_gate,
+                                             gates=gates_for_viz, show_gates=plot_show_gates,
+                                             selected_gate=None,  # Not using selected_gate anymore
                                              keywords=keywords, show_keywords=show_keywords)
                         # Shortened title - just well ID and gate name
                         p.title.text = f"{well_id} - {gate_name}"
@@ -2215,14 +2408,73 @@ class FlowAnalyzer:
         """
         
         header_div = Div(text=header_html, width=1400, sizing_mode="fixed")
-        
+
+        # Create global gate legend (if any gates are visualized across any plot config)
+        # Collect all unique gates from all plot configs
+        all_gates_to_viz = []
+        for pc in plot_configs:
+            if pc.get('plot_type') == 'scatter' and pc.get('show_gates', False):
+                gates_list = pc.get('gates_to_visualize', [])
+                for gate in gates_list:
+                    if gate not in all_gates_to_viz:
+                        all_gates_to_viz.append(gate)
+
+        # Define the same color palette used in scatter plot rendering
+        gate_colors = [
+            ("#6B8E23", "#556B2F"),  # Olive green
+            ("#4682B4", "#36648B"),  # Steel blue
+            ("#CD853F", "#8B5A2B"),  # Peru/tan
+            ("#9370DB", "#7B68EE"),  # Medium purple
+            ("#DC143C", "#B22222"),  # Crimson
+            ("#20B2AA", "#008B8B"),  # Light sea green
+            ("#FF8C00", "#CD6600"),  # Dark orange
+            ("#8B4789", "#68387E"),  # Dark orchid
+        ]
+
+        # Build legend HTML
+        legend_items_html = ""
+        if all_gates_to_viz:
+            for idx, gate_name in enumerate(all_gates_to_viz):
+                fill_color, line_color = gate_colors[idx % len(gate_colors)]
+                legend_items_html += f"""
+                <div class="flex items-center mr-6">
+                    <div style="width: 20px; height: 20px; background-color: {fill_color}; border: 2px solid {line_color}; border-radius: 3px; margin-right: 8px;"></div>
+                    <span class="text-sm text-gray-700">{gate_name}</span>
+                </div>
+                """
+
+            legend_html = f"""
+            {tailwind_cdn}
+            <div class="w-full bg-gray-50 border-b border-gray-200">
+                <div class="max-w-7xl mx-auto py-3 px-4">
+                    <div class="flex items-center">
+                        <span class="text-sm font-semibold text-gray-700 mr-4">Gates:</span>
+                        <div class="flex flex-wrap items-center">
+                            {legend_items_html}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
+            legend_div = Div(text=legend_html, width=1400, sizing_mode="fixed")
+        else:
+            legend_div = None
+
         # Use fixed sizing to prevent layout issues and overlapping
-        # Header with modal, then plots (no summary div - it's in the modal)
-        final_layout = column(
-            header_div,
-            layout,
-            sizing_mode="fixed"
-        )
+        # Header with modal, optional legend, then plots (no summary div - it's in the modal)
+        if legend_div:
+            final_layout = column(
+                header_div,
+                legend_div,
+                layout,
+                sizing_mode="fixed"
+            )
+        else:
+            final_layout = column(
+                header_div,
+                layout,
+                sizing_mode="fixed"
+            )
         
         # Save to HTML
         output_file(output_path)
