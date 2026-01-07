@@ -73,3 +73,10 @@ htmlcov/
 # Temporary files
 *.tmp
 .cache/
+
+# Debug and test scripts (development only)
+debug_*.py
+test_*.py
+check_*.py
+inspect_*.py
+list_*.py

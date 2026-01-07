@@ -110,11 +110,13 @@ Notes:
 """
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Analyze FlowJo Workspace and generate interactive HTML plots.")
+    parser = argparse.ArgumentParser(description="Analyze FlowJo Workspace and generate interactive HTML plots or inspect gate hierarchy.")
     parser.add_argument("--wsp", required=True, help="Path to the FlowJo .wsp file")
     parser.add_argument("--fcs_dir", help="Directory containing .fcs files (if different from wsp directory)")
     parser.add_argument("--output", default="report.html", help="Output HTML file path (auto-generated if not specified)")
-    parser.add_argument("--interactive", action="store_true", required=True, help="Run interactive plotting mode (required)")
+    parser.add_argument("--interactive", action="store_true", help="Run interactive plotting mode")
+    parser.add_argument("--inspect", action="store_true", help="Run inspect mode to view gate hierarchy")
+    parser.add_argument("--sample", help="Optional sample ID to inspect (inspect mode only)")
     return parser.parse_args()
 
 class FlowAnalyzer:
@@ -397,12 +399,558 @@ class FlowAnalyzer:
         
         return gates_by_path
 
+    def _extract_quadrant_gate(self, sample_id, gate_name, gate_path, x_channel, y_channel):
+        """
+        Extract quadrant gate divider information for visualization on scatter plots.
+        
+        Args:
+            sample_id (str): Sample ID to extract gate from
+            gate_name (str): Name of the quadrant gate
+            gate_path (tuple): Path tuple for the gate
+            x_channel (str): X-axis channel name (e.g., "FSC-A")
+            y_channel (str): Y-axis channel name (e.g., "SSC-A")
+        
+        Returns:
+            dict or None: Dictionary containing quadrant gate data, or None if not a quadrant gate:
+                - 'name': Gate name
+                - 'type': 'quadrant'
+                - 'x_dim': X-axis channel name
+                - 'y_dim': Y-axis channel name
+                - 'dividers': List of divider dictionaries with:
+                    - 'dimension': Channel name
+                    - 'value': Divider value (in raw data space)
+                    - 'orientation': 'vertical' or 'horizontal'
+        """
+        try:
+            # Handle "Ungated" case
+            if gate_name == "Ungated":
+                return None
+
+            # Get the gate using the parent path
+            get_gate_path = gate_path[:-1] if len(gate_path) > 1 else ()
+            gate = self.workspace.get_gate(sample_id, gate_name, gate_path=get_gate_path)
+            
+            # Check if this is a quadrant gate
+            # QuadrantGate has 'dividers' and/or 'quadrants' attributes
+            has_dividers = hasattr(gate, 'dividers') and len(gate.dividers) > 0
+            has_quadrants = hasattr(gate, 'quadrants') and len(gate.quadrants) > 0
+            
+            # If this gate doesn't have dividers but looks like a quadrant region (Q1-Q4),
+            # try to find a parent QuadrantGate or sibling gate with dividers
+            if not (has_dividers or has_quadrants):
+                # Check if this is a quadrant region gate (Q1, Q2, Q3, Q4)
+                is_quadrant_region = False
+                try:
+                    import re
+                    if re.match(r'^Q\d+:', gate_name):
+                        is_quadrant_region = True
+                except:
+                    pass
+                
+                if is_quadrant_region:
+                    print(f"    DEBUG: Gate '{gate_name}' is a quadrant region, searching for QuadrantGate with dividers...")
+                    # Search for gates that might have dividers
+                    # Check: 1) Same path level (siblings), 2) Parent path level
+                    all_gate_ids = self.workspace.get_gate_ids(sample_id)
+                    parent_quadrant_gate = None
+                    parent_path = gate_path[:-1] if len(gate_path) > 0 else ()
+                    
+                    # First, try to find a gate at the same path level with dividers
+                    for other_gate_name, other_gate_path in all_gate_ids:
+                        # Skip the current gate
+                        if other_gate_name == gate_name and other_gate_path == gate_path:
+                            continue
+                            
+                        # Check gates at same path level OR parent path level
+                        if other_gate_path == gate_path or other_gate_path == parent_path:
+                            try:
+                                other_get_gate_path = other_gate_path[:-1] if len(other_gate_path) > 1 else ()
+                                other_gate = self.workspace.get_gate(sample_id, other_gate_name, gate_path=other_get_gate_path)
+                                
+                                # Check if this gate has dividers and matches our channels
+                                if hasattr(other_gate, 'dividers') and len(other_gate.dividers) > 0:
+                                    if len(other_gate.dimensions) == 2:
+                                        other_dims = [d.id for d in other_gate.dimensions]
+                                        if ((other_dims[0] == x_channel and other_dims[1] == y_channel) or
+                                            (other_dims[0] == y_channel and other_dims[1] == x_channel)):
+                                            parent_quadrant_gate = other_gate
+                                            print(f"    DEBUG: Found QuadrantGate '{other_gate_name}' at path {other_gate_path} with {len(other_gate.dividers)} divider(s)")
+                                            break
+                            except Exception as e:
+                                print(f"    DEBUG: Error checking gate '{other_gate_name}': {e}")
+                                continue
+                    
+                    if parent_quadrant_gate:
+                        gate = parent_quadrant_gate
+                        has_dividers = hasattr(gate, 'dividers') and len(gate.dividers) > 0
+                        has_quadrants = hasattr(gate, 'quadrants') and len(gate.quadrants) > 0
+                    else:
+                        print(f"    DEBUG: Could not find QuadrantGate with dividers for '{gate_name}'")
+                        print(f"           Attempting to infer dividers from Q1-Q4 quadrant regions...")
+                        # Fallback: Try to infer dividers from Q1-Q4 gates themselves
+                        inferred_dividers = self._infer_quadrant_dividers_from_regions(
+                            sample_id, gate_path, x_channel, y_channel
+                        )
+                        if inferred_dividers:
+                            print(f"    DEBUG: Successfully inferred {len(inferred_dividers)} divider(s) from quadrant regions")
+                            # Get dimensions from the current gate
+                            if len(gate.dimensions) == 2:
+                                dims = [d.id for d in gate.dimensions]
+                                return {
+                                    'name': f"Quadrants ({gate_name})",
+                                    'type': 'quadrant',
+                                    'x_dim': dims[0],
+                                    'y_dim': dims[1],
+                                    'dividers': inferred_dividers
+                                }
+                        print(f"    DEBUG: Could not infer dividers from quadrant regions")
+                        return None
+                else:
+                    print(f"    DEBUG: Gate '{gate_name}' does not have dividers or quadrants attributes")
+                    return None
+            
+            divider_count = len(gate.dividers) if has_dividers else 0
+            quadrant_count = len(gate.quadrants) if has_quadrants else 0
+            print(f"    DEBUG: Detected quadrant gate '{gate_name}' with {divider_count} divider(s) and {quadrant_count} quadrant(s)")
+            
+            # Check dimensions
+            if len(gate.dimensions) != 2:
+                return None
+            
+            dims = [d.id for d in gate.dimensions]  # Channel names
+            
+            # Check if gate matches our axes (in either order)
+            if not ((dims[0] == x_channel and dims[1] == y_channel) or
+                   (dims[0] == y_channel and dims[1] == x_channel)):
+                return None
+            
+            # Extract dividers
+            dividers = []
+            divider_list = gate.dividers if hasattr(gate, 'dividers') else []
+            for divider in divider_list:
+                try:
+                    # Get divider dimension and value
+                    # Try multiple possible attribute names for divider properties
+                    divider_dim = None
+                    divider_value = None
+                    
+                    # Try different possible attribute names for dimension reference
+                    for attr_name in ['dimension_ref', 'dimension', 'dim_ref', 'dim']:
+                        if hasattr(divider, attr_name):
+                            attr_value = getattr(divider, attr_name)
+                            # Could be a string or a Dimension object
+                            if isinstance(attr_value, str):
+                                divider_dim = attr_value
+                            elif hasattr(attr_value, 'id'):
+                                divider_dim = attr_value.id
+                            elif hasattr(attr_value, '__str__'):
+                                divider_dim = str(attr_value)
+                            if divider_dim:
+                                break
+                    
+                    # Try different possible attribute names for divider value
+                    for attr_name in ['value', 'position', 'divider_value', 'threshold']:
+                        if hasattr(divider, attr_name):
+                            divider_value = getattr(divider, attr_name)
+                            if divider_value is not None:
+                                break
+                    
+                    if divider_dim and divider_value is not None:
+                        # Determine orientation
+                        if divider_dim == x_channel:
+                            orientation = 'vertical'
+                        elif divider_dim == y_channel:
+                            orientation = 'horizontal'
+                        else:
+                            # Divider doesn't match our axes
+                            continue
+                        
+                        # Convert divider value from display space to raw data space if needed
+                        # Similar to polygon gate conversion
+                        try:
+                            # Divider values might be in display space (0-1) or already in raw space
+                            # Try to convert if it's in display space (values between 0 and 1)
+                            if 0 <= divider_value <= 1:
+                                # Convert from display space to raw values
+                                display_min_log = 0  # log10(1)
+                                display_max_log = 5  # log10(100000)
+                                divider_value = 10 ** (display_min_log + divider_value * (display_max_log - display_min_log))
+                        except:
+                            # If conversion fails, use value as-is (might already be in raw space)
+                            pass
+                        
+                        dividers.append({
+                            'dimension': divider_dim,
+                            'value': divider_value,
+                            'orientation': orientation
+                        })
+                except Exception as e:
+                    print(f"    DEBUG: Could not extract divider: {e}")
+                    continue
+            
+            if dividers:
+                return {
+                    'name': gate_name,
+                    'type': 'quadrant',
+                    'x_dim': dims[0],
+                    'y_dim': dims[1],
+                    'dividers': dividers
+                }
+        except Exception as e:
+            print(f"    DEBUG: Could not extract quadrant gate '{gate_name}': {e}")
+        
+        return None
+    
+    def _infer_quadrant_dividers_from_regions(self, sample_id, gate_path, x_channel, y_channel):
+        """
+        Infer quadrant divider positions from Q1-Q4 region gates.
+        
+        Args:
+            sample_id (str): Sample ID
+            gate_path (tuple): Path tuple for the quadrant gates
+            x_channel (str): X-axis channel name
+            y_channel (str): Y-axis channel name
+        
+        Returns:
+            list or None: List of divider dictionaries, or None if inference fails
+        """
+        try:
+            import re
+            import numpy as np
+
+            print(f"\n    DEBUG _infer_quadrant_dividers_from_regions:")
+            print(f"           sample_id: {sample_id}")
+            print(f"           gate_path: {gate_path}")
+            print(f"           x_channel: {x_channel}")
+            print(f"           y_channel: {y_channel}")
+
+            # Find all Q1-Q4 gates at this path
+            all_gate_ids = self.workspace.get_gate_ids(sample_id)
+            quadrant_gates = {}
+            get_gate_path = gate_path[:-1] if len(gate_path) > 1 else ()
+
+            print(f"           Checking {len(all_gate_ids)} total gates...")
+            gates_at_target_path = [(name, path) for name, path in all_gate_ids if path == gate_path]
+            print(f"           Found {len(gates_at_target_path)} gates at target path {gate_path}")
+            
+            for gate_name, other_gate_path in all_gate_ids:
+                if other_gate_path == gate_path:
+                    # Check if it's a Q1-Q4 gate
+                    if re.match(r'^Q\d+:', gate_name):
+                        try:
+                            gate = self.workspace.get_gate(sample_id, gate_name, gate_path=get_gate_path)
+                            if len(gate.dimensions) == 2:
+                                dims = [d.id for d in gate.dimensions]
+                                # Check if dimensions match
+                                if ((dims[0] == x_channel and dims[1] == y_channel) or
+                                    (dims[0] == y_channel and dims[1] == x_channel)):
+                                    # Extract quadrant number
+                                    match = re.match(r'^Q(\d+):', gate_name)
+                                    if match:
+                                        q_num = int(match.group(1))
+                                        quadrant_gates[q_num] = {
+                                            'name': gate_name,
+                                            'gate': gate,
+                                            'dims': dims
+                                        }
+                        except Exception as e:
+                            print(f"    DEBUG: Error getting gate '{gate_name}': {e}")
+                            continue
+            
+            if len(quadrant_gates) < 2:
+                print(f"    DEBUG: Found only {len(quadrant_gates)} quadrant gates, need at least 2")
+                return None
+            
+            # Debug: Print what attributes the Q gates have
+            print(f"    DEBUG: Found {len(quadrant_gates)} quadrant gates: {list(quadrant_gates.keys())}")
+
+            # NEW APPROACH: Parse XML directly to extract min/max values
+            # Import the helper function
+            from quadrant_xml_parser import infer_quadrant_dividers_from_xml
+
+            result = infer_quadrant_dividers_from_xml(
+                self.wsp_path,
+                sample_id,
+                gate_path,
+                x_channel,
+                y_channel,
+                quadrant_gates
+            )
+
+            return result
+
+            # FALLBACK: If XML parsing fails, try other methods
+            gate_boundaries = {}
+            for q_num, q_info in quadrant_gates.items():
+                gate = q_info['gate']
+                print(f"    DEBUG: Q{q_num} ('{q_info['name']}'):")
+
+                # Try to get min/max from the gate
+                if hasattr(gate, 'vertices') and gate.vertices is not None and len(gate.vertices) > 0:
+                    # Polygon-style gate - extract bounding box
+                    verts = np.array(gate.vertices)
+                    gate_boundaries[q_num] = {
+                        'x_min': float(verts[:, 0].min()),
+                        'x_max': float(verts[:, 0].max()),
+                        'y_min': float(verts[:, 1].min()),
+                        'y_max': float(verts[:, 1].max()),
+                        'source': 'vertices'
+                    }
+                    print(f"           Got boundaries from vertices: X=[{gate_boundaries[q_num]['x_min']:.4f}, {gate_boundaries[q_num]['x_max']:.4f}], Y=[{gate_boundaries[q_num]['y_min']:.4f}, {gate_boundaries[q_num]['y_max']:.4f}]")
+                elif hasattr(gate, 'min') and hasattr(gate, 'max'):
+                    # Rectangle gate with min/max attributes
+                    dims = q_info['dims']
+                    try:
+                        min_vals = gate.min
+                        max_vals = gate.max
+
+                        # Extract min/max for our dimensions
+                        if isinstance(min_vals, dict) and isinstance(max_vals, dict):
+                            x_min = min_vals.get(x_channel, None)
+                            x_max = max_vals.get(x_channel, None)
+                            y_min = min_vals.get(y_channel, None)
+                            y_max = max_vals.get(y_channel, None)
+                        else:
+                            # Assume it's array-like [x, y]
+                            x_idx = 0 if dims[0] == x_channel else 1
+                            y_idx = 1 - x_idx
+                            x_min = min_vals[x_idx] if hasattr(min_vals, '__getitem__') else None
+                            x_max = max_vals[x_idx] if hasattr(max_vals, '__getitem__') else None
+                            y_min = min_vals[y_idx] if hasattr(min_vals, '__getitem__') else None
+                            y_max = max_vals[y_idx] if hasattr(max_vals, '__getitem__') else None
+
+                        if all(v is not None for v in [x_min, x_max, y_min, y_max]):
+                            gate_boundaries[q_num] = {
+                                'x_min': float(x_min),
+                                'x_max': float(x_max),
+                                'y_min': float(y_min),
+                                'y_max': float(y_max),
+                                'source': 'min/max'
+                            }
+                            print(f"           Got boundaries from min/max: X=[{x_min:.4f}, {x_max:.4f}], Y=[{y_min:.4f}, {y_max:.4f}]")
+                    except Exception as e:
+                        print(f"           Failed to extract min/max: {e}")
+
+            if len(gate_boundaries) >= 2:
+                print(f"    DEBUG: Successfully extracted {len(gate_boundaries)} gate boundaries")
+                print(f"    DEBUG: Converting from display space (0-1) to raw data space...")
+
+                # Transform from display space to raw values (same as polygon gates)
+                # FlowJo typically displays log scale from 10^0 to 10^5 (1 to 100,000)
+                display_min_log = 0  # log10(1)
+                display_max_log = 5  # log10(100000)
+
+                transformed_boundaries = {}
+                for q_num, bounds in gate_boundaries.items():
+                    transformed_boundaries[q_num] = {
+                        'x_min': 10 ** (display_min_log + bounds['x_min'] * (display_max_log - display_min_log)),
+                        'x_max': 10 ** (display_min_log + bounds['x_max'] * (display_max_log - display_min_log)),
+                        'y_min': 10 ** (display_min_log + bounds['y_min'] * (display_max_log - display_min_log)),
+                        'y_max': 10 ** (display_min_log + bounds['y_max'] * (display_max_log - display_min_log)),
+                    }
+                    print(f"    DEBUG: Q{q_num} transformed: X=[{transformed_boundaries[q_num]['x_min']:.2f}, {transformed_boundaries[q_num]['x_max']:.2f}], Y=[{transformed_boundaries[q_num]['y_min']:.2f}, {transformed_boundaries[q_num]['y_max']:.2f}]")
+
+                # Now infer dividers from the transformed boundaries
+                quadrant_data = transformed_boundaries
+            else:
+                print(f"    DEBUG: Could not extract enough gate boundaries ({len(gate_boundaries)})")
+                print(f"    DEBUG: Direct boundary extraction failed - cannot infer quadrant dividers")
+                return None
+
+            # quadrant_data now contains the transformed boundaries
+            # Continue with divider inference below
+            if len(quadrant_data) < 2:
+                print(f"    DEBUG: Could not get data from enough quadrants ({len(quadrant_data)})")
+                return None
+
+            # Infer divider positions from quadrant boundaries
+            # Q1: FITC-A- (X-), APC-Vio770-A+ (Y+) -> X < divider_x, Y > divider_y
+            # Q2: FITC-A+ (X+), APC-Vio770-A+ (Y+) -> X > divider_x, Y > divider_y
+            # Q3: FITC-A+ (X+), APC-Vio770-A- (Y-) -> X > divider_x, Y < divider_y
+            # Q4: FITC-A- (X-), APC-Vio770-A- (Y-) -> X < divider_x, Y < divider_y
+            
+            dividers = []
+            
+            # X divider: boundary between Q1/Q4 (X-) and Q2/Q3 (X+)
+            # Should be between max X of Q1/Q4 and min X of Q2/Q3
+            x_negative_max = []  # Q1, Q4
+            x_positive_min = []  # Q2, Q3
+            
+            for q_num, data in quadrant_data.items():
+                if q_num in [1, 4]:  # Negative X
+                    x_negative_max.append(data['x_max'])
+                elif q_num in [2, 3]:  # Positive X
+                    x_positive_min.append(data['x_min'])
+            
+            if x_negative_max and x_positive_min:
+                x_divider = (max(x_negative_max) + min(x_positive_min)) / 2.0
+                dividers.append({
+                    'dimension': x_channel,
+                    'value': float(x_divider),
+                    'orientation': 'vertical'
+                })
+                print(f"    DEBUG: Inferred X divider at {x_divider:.2f} for {x_channel}")
+            
+            # Y divider: boundary between Q1/Q2 (Y+) and Q3/Q4 (Y-)
+            # Should be between max Y of Q3/Q4 and min Y of Q1/Q2
+            y_negative_max = []  # Q3, Q4
+            y_positive_min = []  # Q1, Q2
+            
+            for q_num, data in quadrant_data.items():
+                if q_num in [3, 4]:  # Negative Y
+                    y_negative_max.append(data['y_max'])
+                elif q_num in [1, 2]:  # Positive Y
+                    y_positive_min.append(data['y_min'])
+            
+            if y_negative_max and y_positive_min:
+                y_divider = (max(y_negative_max) + min(y_positive_min)) / 2.0
+                dividers.append({
+                    'dimension': y_channel,
+                    'value': float(y_divider),
+                    'orientation': 'horizontal'
+                })
+                print(f"    DEBUG: Inferred Y divider at {y_divider:.2f} for {y_channel}")
+            
+            if len(dividers) > 0:
+                return dividers
+            else:
+                return None
+        except Exception as e:
+            print(f"    DEBUG: Error in _infer_quadrant_dividers_from_regions: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+                    
+    
+    def _extract_quadrant_thresholds_from_parent(self, sample_id, gate_path, x_channel, y_channel):
+        """
+        Extract X and Y thresholds from a parent QuadrantGate for quadrant mode visualization.
+        
+        Searches for a QuadrantGate at the same path level or parent path level that matches
+        the specified channels. Extracts divider values and converts them from display space
+        to raw data space.
+        
+        Also checks if any gate at the path has quadrant-related attributes that might contain
+        divider information.
+        
+        Args:
+            sample_id (str): Sample ID to extract gate from
+            gate_path (tuple): Path tuple where Q1-Q4 gates are located (e.g., ('root', 'Cells', 'Singlets'))
+            x_channel (str): X-axis channel name (e.g., "B1-A")
+            y_channel (str): Y-axis channel name (e.g., "R2-A")
+        
+        Returns:
+            dict or None: Dictionary with 'x_threshold' and 'y_threshold' in raw data space, or None if not found
+        """
+        try:
+            # Search for a QuadrantGate with dividers at the same path or parent path
+            all_gate_ids = self.workspace.get_gate_ids(sample_id)
+            parent_path = gate_path[:-1] if len(gate_path) > 0 else ()
+            
+            # Debug: Print what gates we're checking
+            print(f"    DEBUG: Searching for QuadrantGate with dividers...")
+            print(f"           Looking at path: {gate_path}")
+            print(f"           Parent path: {parent_path}")
+            print(f"           Channels: {x_channel} × {y_channel}")
+            
+            # Search at same path level and parent path level
+            checked_gates = []
+            for other_gate_name, other_gate_path in all_gate_ids:
+                # Check gates at same path level OR parent path level
+                if other_gate_path == gate_path or other_gate_path == parent_path:
+                    try:
+                        other_get_gate_path = other_gate_path[:-1] if len(other_gate_path) > 1 else ()
+                        other_gate = self.workspace.get_gate(sample_id, other_gate_name, gate_path=other_get_gate_path)
+                        checked_gates.append((other_gate_name, other_gate_path, hasattr(other_gate, 'dividers')))
+                        
+                        # Check if this gate has dividers and matches our channels
+                        has_dividers = hasattr(other_gate, 'dividers') and len(other_gate.dividers) > 0
+                        if has_dividers:
+                            print(f"    DEBUG: Found gate '{other_gate_name}' with dividers at path {other_gate_path}")
+                            if len(other_gate.dimensions) == 2:
+                                other_dims = [d.id for d in other_gate.dimensions]
+                                if ((other_dims[0] == x_channel and other_dims[1] == y_channel) or
+                                    (other_dims[0] == y_channel and other_dims[1] == x_channel)):
+                                    
+                                    # Extract dividers
+                                    x_threshold = None
+                                    y_threshold = None
+                                    
+                                    divider_list = other_gate.dividers
+                                    for divider in divider_list:
+                                        try:
+                                            # Get divider dimension and value
+                                            divider_dim = None
+                                            divider_value = None
+                                            
+                                            # Try different possible attribute names for dimension reference
+                                            for attr_name in ['dimension_ref', 'dimension', 'dim_ref', 'dim']:
+                                                if hasattr(divider, attr_name):
+                                                    attr_value = getattr(divider, attr_name)
+                                                    if isinstance(attr_value, str):
+                                                        divider_dim = attr_value
+                                                    elif hasattr(attr_value, 'id'):
+                                                        divider_dim = attr_value.id
+                                                    elif hasattr(attr_value, '__str__'):
+                                                        divider_dim = str(attr_value)
+                                                    if divider_dim:
+                                                        break
+                                            
+                                            # Try different possible attribute names for divider value
+                                            for attr_name in ['value', 'position', 'divider_value', 'threshold']:
+                                                if hasattr(divider, attr_name):
+                                                    divider_value = getattr(divider, attr_name)
+                                                    if divider_value is not None:
+                                                        break
+                                            
+                                            if divider_dim and divider_value is not None:
+                                                # Convert divider value from display space to raw data space if needed
+                                                try:
+                                                    # Divider values might be in display space (0-1) or already in raw space
+                                                    if 0 <= divider_value <= 1:
+                                                        # Convert from display space to raw values
+                                                        display_min_log = 0  # log10(1)
+                                                        display_max_log = 5  # log10(100000)
+                                                        divider_value = 10 ** (display_min_log + divider_value * (display_max_log - display_min_log))
+                                                except:
+                                                    # If conversion fails, use value as-is (might already be in raw space)
+                                                    pass
+                                                
+                                                # Assign to x or y threshold based on dimension
+                                                if divider_dim == x_channel:
+                                                    x_threshold = divider_value
+                                                elif divider_dim == y_channel:
+                                                    y_threshold = divider_value
+                                        except Exception as e:
+                                            continue
+                                    
+                                    # Return thresholds if we found both
+                                    if x_threshold is not None and y_threshold is not None:
+                                        return {
+                                            'x_threshold': float(x_threshold),
+                                            'y_threshold': float(y_threshold)
+                                        }
+                    except Exception as e:
+                        continue
+            
+            # Debug output
+            if checked_gates:
+                print(f"    DEBUG: Checked {len(checked_gates)} gates:")
+                for gate_name, gate_path, has_div in checked_gates[:5]:  # Show first 5
+                    print(f"           - '{gate_name}' at {gate_path}: has_dividers={has_div}")
+            else:
+                print(f"    DEBUG: No gates found at path {gate_path} or parent path {parent_path}")
+            
+            return None
+        except Exception as e:
+            return None
+    
     def _extract_gate_polygons(self, sample_id, x_channel, y_channel):
         """
         Extract gate polygon coordinates for visualization on scatter plots.
         
         Uses get_gate_ids() to get all gates, then extracts polygon coordinates
-        for gates that match the specified x and y channels.
+        for gates that match the specified x and y channels. Also extracts quadrant gates.
         
         Args:
             sample_id (str): Sample ID to extract gates from
@@ -412,10 +960,12 @@ class FlowAnalyzer:
         Returns:
             list: List of dictionaries, each containing:
                 - 'name': Gate name
+                - 'type': Gate type ('polygon', 'rectangle', or 'quadrant')
                 - 'x_dim': X-axis channel name
                 - 'y_dim': Y-axis channel name
-                - 'xs': List of X coordinates
-                - 'ys': List of Y coordinates
+                - 'xs': List of X coordinates (for polygon/rectangle gates)
+                - 'ys': List of Y coordinates (for polygon/rectangle gates)
+                - 'dividers': List of dividers (for quadrant gates)
         """
         gates_data = []
         gate_ids = self.workspace.get_gate_ids(sample_id)
@@ -431,7 +981,14 @@ class FlowAnalyzer:
                     if (dims[0] == x_channel and dims[1] == y_channel) or \
                        (dims[0] == y_channel and dims[1] == x_channel):
                         
-                        # Get vertices
+                        # Check if this is a quadrant gate first
+                        if hasattr(gate, 'dividers') and hasattr(gate, 'quadrants'):
+                            quadrant_gate = self._extract_quadrant_gate(sample_id, gate_name, gate_path, x_channel, y_channel)
+                            if quadrant_gate:
+                                gates_data.append(quadrant_gate)
+                                continue
+                        
+                        # Get vertices for polygon/rectangle gates
                         xs = []
                         ys = []
                         
@@ -515,6 +1072,7 @@ class FlowAnalyzer:
                         if xs and ys:
                             gates_data.append({
                                 'name': gate_name,
+                                'type': 'polygon' if hasattr(gate, 'vertices') else 'rectangle',
                                 'x_dim': dims[0],
                                 'y_dim': dims[1],
                                 'xs': xs,
@@ -527,7 +1085,7 @@ class FlowAnalyzer:
 
     def _extract_selected_gate(self, sample_id, gate_name, gate_path, x_channel, y_channel):
         """
-        Extract polygon coordinates for a specific gate for visualization on scatter plots.
+        Extract polygon or quadrant gate coordinates for a specific gate for visualization on scatter plots.
         
         Args:
             sample_id (str): Sample ID to extract gate from
@@ -537,12 +1095,20 @@ class FlowAnalyzer:
             y_channel (str): Y-axis channel name (e.g., "SSC-A")
         
         Returns:
-            dict or None: Dictionary containing gate polygon data, or None if gate not found:
+            dict or None: Dictionary containing gate data, or None if gate not found:
+                For polygon/rectangle gates:
                 - 'name': Gate name
+                - 'type': 'polygon' or 'rectangle'
                 - 'x_dim': X-axis channel name
                 - 'y_dim': Y-axis channel name
                 - 'xs': List of X coordinates
                 - 'ys': List of Y coordinates
+                For quadrant gates:
+                - 'name': Gate name
+                - 'type': 'quadrant'
+                - 'x_dim': X-axis channel name
+                - 'y_dim': Y-axis channel name
+                - 'dividers': List of divider dictionaries
         """
         try:
             # Handle "Ungated" case
@@ -569,7 +1135,60 @@ class FlowAnalyzer:
                 print(f"    DEBUG: Channel mismatch!")
                 return None
             
-            # Get vertices
+            # Check if this is a quadrant gate first (comprehensive detection)
+            is_quadrant = False
+            
+            # Method 1: Check for dividers/quadrants attributes
+            if hasattr(gate, 'dividers') and hasattr(gate, 'quadrants'):
+                if len(gate.dividers) > 0 or len(gate.quadrants) > 0:
+                    is_quadrant = True
+            elif hasattr(gate, 'dividers') and len(gate.dividers) > 0:
+                is_quadrant = True
+            elif hasattr(gate, 'quadrants') and len(gate.quadrants) > 0:
+                is_quadrant = True
+            
+            # Method 2: Check gate class name
+            if not is_quadrant:
+                try:
+                    gate_class_name = gate.__class__.__name__
+                    if 'Quadrant' in gate_class_name:
+                        is_quadrant = True
+                except:
+                    pass
+            
+            # Method 2b: Try isinstance check with flowkit gates
+            if not is_quadrant:
+                try:
+                    import flowkit.gates as fk_gates
+                    if isinstance(gate, (fk_gates.QuadrantGate, fk_gates.Quadrant)):
+                        is_quadrant = True
+                except (ImportError, AttributeError):
+                    pass
+            
+            # Method 3: Heuristic based on gate name pattern (Q1:, Q2:, etc.)
+            if not is_quadrant:
+                try:
+                    if gate_name.startswith('Q') and ':' in gate_name:
+                        # Check if it's Q followed by a number
+                        import re
+                        if re.match(r'^Q\d+:', gate_name):
+                            # Also check that it doesn't have vertices (polygon) or min/max (rectangle)
+                            has_vertices = hasattr(gate, 'vertices') and len(gate.vertices) > 0
+                            has_min_max = (hasattr(gate, 'min') and hasattr(gate, 'max'))
+                            if not has_vertices and not has_min_max:
+                                is_quadrant = True
+                except:
+                    pass
+            
+            if is_quadrant:
+                quadrant_gate = self._extract_quadrant_gate(sample_id, gate_name, gate_path, x_channel, y_channel)
+                if quadrant_gate:
+                    print(f"    DEBUG: Extracted quadrant gate '{gate_name}' with {len(quadrant_gate['dividers'])} divider(s)")
+                    return quadrant_gate
+                else:
+                    print(f"    DEBUG: Detected as quadrant but extraction failed")
+            
+            # Get vertices for polygon/rectangle gates
             xs = []
             ys = []
             
@@ -668,6 +1287,7 @@ class FlowAnalyzer:
 
                 return {
                     'name': gate_name,
+                    'type': 'polygon' if hasattr(gate, 'vertices') else 'rectangle',
                     'x_dim': dims[0],
                     'y_dim': dims[1],
                     'xs': xs,
@@ -774,7 +1394,34 @@ class FlowAnalyzer:
         
         print(f"\n✓ Selected {len(selected_groups)} group(s) with {len(all_sample_ids)} total samples")
         
-        # Step 0.5: Ask how many plots to generate
+        # Step 0.5: Gate mode selection (quadrant vs polygon)
+        print("\n" + "="*60)
+        print("Gate Mode Selection")
+        print("="*60)
+        print("Choose the type of gates to visualize:")
+        print("  1. Polygon gates (default)")
+        print("  2. Quadrant gates")
+        
+        gate_mode = 'polygon'  # Default
+        while True:
+            try:
+                mode_choice = input(f"\nSelect gate mode (1-2, default=1): ").strip()
+                if not mode_choice:
+                    mode_choice = "1"
+                if mode_choice == "1":
+                    gate_mode = 'polygon'
+                    print("✓ Selected: Polygon gates")
+                    break
+                elif mode_choice == "2":
+                    gate_mode = 'quadrant'
+                    print("✓ Selected: Quadrant gates")
+                    break
+                else:
+                    print("Please enter 1 for Polygon gates or 2 for Quadrant gates")
+            except KeyboardInterrupt:
+                return None
+        
+        # Step 0.6: Ask how many plots to generate
         print("\n" + "="*60)
         print("Multiple Plots Configuration")
         print("="*60)
@@ -1186,21 +1833,83 @@ class FlowAnalyzer:
             # Get gate names for selected path
             gate_options = gates_by_path[selected_path_str]
             print(f"\nAvailable gates in path '{selected_path_str}':")
-            for i, (gate_name, gate_path) in enumerate(gate_options, 1):
-                print(f"{i}. {gate_name}")
             
-            # Prompt for gate name selection
-            while True:
-                try:
-                    gate_choice = input(f"\nSelect gate name (1-{len(gate_options)}): ").strip()
-                    gate_idx = int(gate_choice) - 1
-                    if 0 <= gate_idx < len(gate_options):
-                        selected_gate_name, selected_gate_path = gate_options[gate_idx]
-                        break
+            # Check if this path has a parent (not root)
+            use_parent_option = False
+            parent_gate_name = None
+            parent_gate_path = None
+            
+            if selected_path_str != "root":
+                # Find the parent gate by looking at the path structure
+                # e.g., "root → Cells → Singlets" has parent "Singlets" at "root → Cells"
+                path_parts = selected_path_str.split(" → ")
+                if len(path_parts) > 1:
+                    # Parent path is everything except the last part
+                    parent_path_str = " → ".join(path_parts[:-1])
+                    if parent_path_str in gates_by_path:
+                        parent_gates = gates_by_path[parent_path_str]
+                        # The parent gate is the last gate in the parent path
+                        if parent_gates:
+                            parent_gate_name, parent_gate_path = parent_gates[-1]
+                            use_parent_option = True
+            
+            # For quadrant mode, skip individual gate selection (just use parent gate for data filtering)
+            selected_gate_name = None
+            selected_gate_path = None
+            use_gate_data_directly = False
+            
+            if gate_mode == 'quadrant':
+                # In quadrant mode, we only need the parent gate for data filtering
+                # No need to select individual Q1-Q4 gates
+                if use_parent_option:
+                    selected_gate_name = parent_gate_name
+                    selected_gate_path = parent_gate_path
+                    print(f"✓ Using parent gate '{parent_gate_name}' for data filtering (quadrant mode)")
+                else:
+                    # If no parent, use the first gate in the path
+                    if gate_options:
+                        selected_gate_name, selected_gate_path = gate_options[0]
+                        print(f"✓ Using gate '{selected_gate_name}' for data filtering (quadrant mode)")
                     else:
-                        print(f"Please enter a number between 1 and {len(gate_options)}")
-                except ValueError:
-                    print("Please enter a valid number")
+                        print("✗ No gates available in selected path")
+                        continue
+            else:
+                # Polygon mode: show gate selection as before
+                # Display option to use parent gate if available
+                if use_parent_option:
+                    print(f"0. Use parent gate '{parent_gate_name}' (no further gating)")
+                
+                for i, (gate_name, gate_path) in enumerate(gate_options, 1):
+                    print(f"{i}. {gate_name}")
+                
+                # Prompt for gate name selection
+                while True:
+                    try:
+                        max_option = len(gate_options)
+                        if use_parent_option:
+                            prompt_text = f"\nSelect gate name (0 to use parent '{parent_gate_name}', 1-{max_option}): "
+                        else:
+                            prompt_text = f"\nSelect gate name (1-{max_option}): "
+                        
+                        gate_choice = input(prompt_text).strip()
+                        gate_idx = int(gate_choice)
+                        
+                        if use_parent_option and gate_idx == 0:
+                            # User wants to use parent gate
+                            selected_gate_name = parent_gate_name
+                            selected_gate_path = parent_gate_path
+                            print(f"✓ Selected parent gate '{parent_gate_name}' for data filtering (no further gating)")
+                            break
+                        elif 1 <= gate_idx <= max_option:
+                            selected_gate_name, selected_gate_path = gate_options[gate_idx - 1]
+                            break
+                        else:
+                            if use_parent_option:
+                                print(f"Please enter 0 to use parent gate, or a number between 1 and {max_option}")
+                            else:
+                                print(f"Please enter a number between 1 and {max_option}")
+                    except ValueError:
+                        print("Please enter a valid number")
             
             # Get available channels from first sample
             first_sample = self.workspace.get_sample(first_sample_id)
@@ -1214,17 +1923,21 @@ class FlowAnalyzer:
             print("\nPlot types:")
             print("1. Histogram (requires 1 parameter)")
             print("2. Scatter (requires 2 parameters: x and y)")
-            
+            print("3. Contour (density plot, requires 2 parameters: x and y)")
+
             while True:
-                plot_choice = input("\nSelect plot type (1 or 2): ").strip()
+                plot_choice = input("\nSelect plot type (1, 2, or 3): ").strip()
                 if plot_choice == "1":
                     plot_type = "histogram"
                     break
                 elif plot_choice == "2":
                     plot_type = "scatter"
                     break
+                elif plot_choice == "3":
+                    plot_type = "contour"
+                    break
                 else:
-                    print("Please enter 1 for Histogram or 2 for Scatter")
+                    print("Please enter 1 for Histogram, 2 for Scatter, or 3 for Contour")
             
             # Prompt for parameters
             parameters = []
@@ -1292,7 +2005,7 @@ class FlowAnalyzer:
                         break
                     else:
                         print("Please enter 1 for Linear or 2 for Log")
-            else:  # scatter
+            else:  # scatter or contour (both require 2 parameters)
                 while True:
                     try:
                         x_choice = input(f"\nSelect channel for X-axis (1-{len(available_channels)}) or type name: ").strip()
@@ -1351,32 +2064,136 @@ class FlowAnalyzer:
                     except KeyboardInterrupt:
                         return None
                 
-                # Ask about gate visualization for scatter plots
-                print("\n" + "="*60)
-                print("Gate Visualization")
-                print("="*60)
-                print("You can visualize gate boundaries on scatter plots.")
+                # For quadrant mode, extract thresholds from parent QuadrantGate or infer from Q1-Q4
+                quadrant_thresholds = None
+                if gate_mode == 'quadrant':
+                    x_channel = parameters[0]
+                    y_channel = parameters[1]
+                    # Convert selected_path_str to tuple format
+                    path_parts = selected_path_str.split(" → ")
+                    gate_path_tuple = tuple([part.strip() for part in path_parts])
+                    
+                    # First try to extract from parent QuadrantGate
+                    quadrant_thresholds = self._extract_quadrant_thresholds_from_parent(
+                        first_sample_id, gate_path_tuple, x_channel, y_channel
+                    )
+                    
+                    # If not found, try to infer from Q1-Q4 gates
+                    if not quadrant_thresholds:
+                        print(f"\n⚠️  No parent QuadrantGate found. Attempting to infer thresholds from Q1-Q4 gates...")
+                        inferred_dividers = self._infer_quadrant_dividers_from_regions(
+                            first_sample_id, gate_path_tuple, x_channel, y_channel
+                        )
+                        if inferred_dividers:
+                            # Convert dividers to thresholds format
+                            x_threshold = None
+                            y_threshold = None
+                            for divider in inferred_dividers:
+                                if divider.get('orientation') == 'vertical':
+                                    x_threshold = divider.get('value')
+                                elif divider.get('orientation') == 'horizontal':
+                                    y_threshold = divider.get('value')
+                            
+                            if x_threshold is not None and y_threshold is not None:
+                                quadrant_thresholds = {
+                                    'x_threshold': float(x_threshold),
+                                    'y_threshold': float(y_threshold)
+                                }
+                                print(f"✓ Inferred quadrant thresholds from Q1-Q4 gates:")
+                                print(f"   X threshold: {quadrant_thresholds['x_threshold']:.2f}")
+                                print(f"   Y threshold: {quadrant_thresholds['y_threshold']:.2f}")
+                    
+                    if quadrant_thresholds:
+                        print(f"\n✓ Using quadrant thresholds:")
+                        print(f"   X threshold: {quadrant_thresholds['x_threshold']:.2f}")
+                        print(f"   Y threshold: {quadrant_thresholds['y_threshold']:.2f}")
+                    else:
+                        print(f"\n⚠️  Could not extract or infer quadrant thresholds. Switching to polygon mode.")
+                        gate_mode = 'polygon'
                 
-                # Check what gates are available for the selected channels
-                x_channel = parameters[0]
-                y_channel = parameters[1]
+                # Ask about gate visualization for scatter plots (only for polygon mode)
+                # Initialize these variables before the if statement to avoid UnboundLocalError
                 available_gates = []
-                try:
-                    # Get gates from first sample to see what's available
-                    gates_data = self._extract_gate_polygons(first_sample_id, x_channel, y_channel)
-                    available_gates = [g['name'] for g in gates_data]
-                except Exception as e:
-                    pass  # Will show empty list
+                available_gates_with_info = []
+
+                if gate_mode == 'polygon':
+                    print("\n" + "="*60)
+                    print("Gate Visualization")
+                    print("="*60)
+                    print("You can visualize gate boundaries on scatter plots.")
+
+                    # Check what gates are available for the selected channels
+                    x_channel = parameters[0]
+                    y_channel = parameters[1]
+                    try:
+                        # Get gates from first sample to see what's available
+                        gates_data = self._extract_gate_polygons(first_sample_id, x_channel, y_channel)
+                        available_gates = [g['name'] for g in gates_data]
+                        available_gates_with_info = gates_data
+                        
+                        # Also check for child gates and sibling gates of the selected gate
+                        if selected_gate_name and selected_gate_name != "Ungated":
+                            # Get all gate IDs to find children and siblings
+                            all_gate_ids = self.workspace.get_gate_ids(first_sample_id)
+                            # The full path to the selected gate (for finding siblings)
+                            selected_gate_full_path = selected_gate_path + (selected_gate_name,)
+                            # The path prefix for finding children
+                            child_gate_path_prefix = selected_gate_full_path
+                            
+                            print(f"    DEBUG: Looking for gates related to '{selected_gate_name}'")
+                            print(f"           Selected gate path: {selected_gate_path}")
+                            print(f"           Selected gate full path: {selected_gate_full_path}")
+                            
+                            for other_gate_name, other_gate_path in all_gate_ids:
+                                # Skip if this is the selected gate itself
+                                if other_gate_name == selected_gate_name and other_gate_path == selected_gate_path:
+                                    continue
+                                
+                                is_child_or_sibling = False
+                                
+                                # Check if this is a child of the selected gate
+                                # Child path should start with selected gate's full path and be longer
+                                if len(other_gate_path) > len(selected_gate_full_path):
+                                    if other_gate_path[:len(selected_gate_full_path)] == selected_gate_full_path:
+                                        is_child_or_sibling = True
+                                        print(f"    DEBUG: Found child gate '{other_gate_name}' at path {other_gate_path}")
+                                
+                                # Also check if this is a sibling at the same path level as the selected gate
+                                # (e.g., Q1-Q4 are siblings of Singlets, all at "root → Cells → Singlets")
+                                # Siblings have the same path as the selected gate's full path
+                                if other_gate_path == selected_gate_full_path:
+                                    is_child_or_sibling = True
+                                    print(f"    DEBUG: Found sibling gate '{other_gate_name}' at same path {other_gate_path}")
+                                
+                                if is_child_or_sibling:
+                                    # Try to extract gate if it matches channels
+                                    other_gate_data = self._extract_selected_gate(first_sample_id, other_gate_name, other_gate_path, x_channel, y_channel)
+                                    if other_gate_data and other_gate_data['name'] not in available_gates:
+                                        available_gates.append(other_gate_data['name'])
+                                        available_gates_with_info.append(other_gate_data)
+                                        print(f"    DEBUG: Added '{other_gate_name}' to available gates (type: {other_gate_data.get('type', 'unknown')})")
+                                    elif not other_gate_data:
+                                        print(f"    DEBUG: Could not extract '{other_gate_name}' (doesn't match channels or extraction failed)")
+                    except Exception as e:
+                        pass  # Will show empty list
                 
                 # Store which gates to visualize
                 gates_to_visualize = []
 
                 if available_gates:
                     print(f"\nAvailable gates for channels {x_channel} / {y_channel}:")
-                    for i, gate_name in enumerate(available_gates, 1):
-                        print(f"  {i}. {gate_name}")
+                    for i, gate_info in enumerate(available_gates_with_info, 1):
+                        gate_name = gate_info['name']
+                        gate_type = gate_info.get('type', 'unknown')
+                        if gate_type == 'quadrant':
+                            num_dividers = len(gate_info.get('dividers', []))
+                            print(f"  {i}. {gate_name} (quadrant, {num_dividers} divider(s))")
+                        else:
+                            num_vertices = len(gate_info.get('xs', []))
+                            print(f"  {i}. {gate_name} ({gate_type}, {num_vertices} vertices)")
 
                     print("\nYou can visualize gate boundaries on this scatter plot.")
+                    print("Quadrant gates will be shown as divider lines, polygon/rectangle gates as filled regions.")
                     print("This is useful to see gates overlaid on Ungated populations.")
 
                     while True:
@@ -1414,12 +2231,21 @@ class FlowAnalyzer:
                     plot_config_show_gates = False
             
             # Create plot configuration
+            # Check if user selected "use parent gate" option
+            use_parent_for_data = use_parent_option and (selected_gate_name == parent_gate_name)
+            
             plot_config = {
                 'gate_path': selected_gate_path,
                 'gate_name': selected_gate_name,
                 'plot_type': plot_type,
-                'parameters': parameters
+                'parameters': parameters,
+                'use_gate_data_directly': use_parent_for_data,  # Flag to use gate's data directly, not parent's
+                'gate_mode': gate_mode
             }
+            
+            # Add quadrant thresholds if in quadrant mode
+            if gate_mode == 'quadrant' and quadrant_thresholds:
+                plot_config['quadrant_thresholds'] = quadrant_thresholds
             
             # Add statistic and scale choices for histograms
             if plot_type == "histogram":
@@ -1683,17 +2509,18 @@ class FlowAnalyzer:
             
             # Get plot dimensions for positioning
             if scale == "log":
+                x_min = 1
                 x_max = 1e5
             else:
+                x_min = x_grid[0] if len(x_grid) > 0 else 0
                 x_max = x_grid[-1] if len(x_grid) > 0 else 1
-            y_min = 0
             y_max = max_density * 1.1 if max_density > 0 else 1
-            
-            # Position in bottom right with padding
-            keyword_label = Label(x=x_max * 0.98, y=y_min + y_max * 0.02,
+
+            # Position in top left with padding
+            keyword_label = Label(x=x_min + (x_max - x_min) * 0.02, y=y_max * 0.98,
                                  text=keyword_text,
                                  text_font_size="8pt", text_color="black",
-                                 text_align="right", text_baseline="bottom",
+                                 text_align="left", text_baseline="top",
                                  background_fill_color="white",
                                  background_fill_alpha=0.7, border_line_color="gray",
                                  border_line_width=1, x_units="data", y_units="data")
@@ -1701,7 +2528,7 @@ class FlowAnalyzer:
         
         return p
 
-    def _plot_scatter(self, df, x_keyword, y_keyword, sample_id, gate_name, show_gates=False, gates=None, selected_gate=None, show_keywords=False, keywords=None):
+    def _plot_scatter(self, df, x_keyword, y_keyword, sample_id, gate_name, show_gates=False, gates=None, selected_gate=None, show_keywords=False, keywords=None, gate_mode='polygon', quadrant_thresholds=None):
         """
         Generate a scatter plot for two channels using raw (untransformed) data.
         
@@ -1766,8 +2593,34 @@ class FlowAnalyzer:
 
         p.scatter(x=x_channel, y=y_channel, source=source, size=2, alpha=0.6, color="navy")
 
-        # Render gate boundaries if requested
-        if show_gates and gates:
+        # Render quadrant dividers if in quadrant mode
+        if gate_mode == 'quadrant' and quadrant_thresholds:
+            print(f"    → Rendering quadrant dividers on log scale (1 to 10^5)")
+            from bokeh.models import Span
+            
+            # Use a distinct color for quadrant dividers
+            divider_color = "#DC143C"  # Crimson
+            
+            # Render vertical divider (X threshold)
+            if 'x_threshold' in quadrant_thresholds:
+                x_thresh = quadrant_thresholds['x_threshold']
+                span = Span(location=x_thresh, dimension='height',
+                           line_color=divider_color, line_width=2.5,
+                           line_dash='dashed', line_alpha=0.9)
+                p.add_layout(span)
+                print(f"      ✓ Rendered vertical divider at x={x_thresh:.2f}")
+            
+            # Render horizontal divider (Y threshold)
+            if 'y_threshold' in quadrant_thresholds:
+                y_thresh = quadrant_thresholds['y_threshold']
+                span = Span(location=y_thresh, dimension='width',
+                           line_color=divider_color, line_width=2.5,
+                           line_dash='dashed', line_alpha=0.9)
+                p.add_layout(span)
+                print(f"      ✓ Rendered horizontal divider at y={y_thresh:.2f}")
+
+        # Render gate boundaries if requested (polygon mode)
+        elif show_gates and gates:
             print(f"    → Rendering {len(gates)} gate(s) on log scale (1 to 10^5)")
 
             # Color palette for gates (distinct colors/shades)
@@ -1782,38 +2635,76 @@ class FlowAnalyzer:
                 ("#8B4789", "#68387E"),  # Dark orchid
             ]
 
-            # gates should be a list of gate dictionaries with 'name', 'x_dim', 'y_dim', 'xs', 'ys'
+            from bokeh.models import Span
+
+            # gates should be a list of gate dictionaries with 'name', 'x_dim', 'y_dim', 'xs', 'ys' (or 'dividers' for quadrant gates)
             for gate_idx, gate in enumerate(gates):
                 # Check if gate matches current axes
                 if (gate.get('x_dim') == x_channel and gate.get('y_dim') == y_channel) or \
                    (gate.get('x_dim') == y_channel and gate.get('y_dim') == x_channel):
-                    xs = gate.get('xs', [])
-                    ys = gate.get('ys', [])
-                    if xs and ys and len(xs) == len(ys) and len(xs) >= 3:
-                        # Swap if dimensions are reversed
-                        if gate.get('x_dim') == y_channel:
-                            xs, ys = ys, xs
-
-                        print(f"      DEBUG: Gate '{gate.get('name')}' coordinates:")
-                        print(f"             X: [{min(xs):.2f}, {max(xs):.2f}]")
-                        print(f"             Y: [{min(ys):.2f}, {max(ys):.2f}]")
-
-                        # Ensure polygon is closed
-                        if xs[0] != xs[-1] or ys[0] != ys[-1]:
-                            xs = list(xs) + [xs[0]]
-                            ys = list(ys) + [ys[0]]
-
-                        # Get color for this gate
-                        fill_color, line_color = gate_colors[gate_idx % len(gate_colors)]
-
-                        # Plot gates with distinct colors (no legend_label - will add global legend)
-                        # Gates are already in raw data space from inverse transform
-                        # They will be displayed correctly on log-scale axes
-                        p.patch(xs, ys, fill_color=fill_color, fill_alpha=0.3, line_color=line_color,
-                               line_width=2.5, line_alpha=0.9)
-                        print(f"      ✓ Rendered '{gate.get('name')}' ({len(xs)} vertices, color: {fill_color})")
+                    
+                    gate_type = gate.get('type', 'polygon')  # Default to polygon for backward compatibility
+                    
+                    # Handle quadrant gates
+                    if gate_type == 'quadrant':
+                        dividers = gate.get('dividers', [])
+                        if dividers:
+                            # Get color for this gate
+                            fill_color, line_color = gate_colors[gate_idx % len(gate_colors)]
+                            
+                            # Render divider lines
+                            for divider in dividers:
+                                orientation = divider.get('orientation')
+                                value = divider.get('value')
+                                
+                                if orientation == 'vertical' and value is not None:
+                                    # Vertical line (x = value)
+                                    span = Span(location=value, dimension='height',
+                                               line_color=line_color, line_width=2.5,
+                                               line_dash='dashed', line_alpha=0.9)
+                                    p.add_layout(span)
+                                    print(f"      ✓ Rendered vertical divider at x={value:.2f} for '{gate.get('name')}'")
+                                elif orientation == 'horizontal' and value is not None:
+                                    # Horizontal line (y = value)
+                                    span = Span(location=value, dimension='width',
+                                               line_color=line_color, line_width=2.5,
+                                               line_dash='dashed', line_alpha=0.9)
+                                    p.add_layout(span)
+                                    print(f"      ✓ Rendered horizontal divider at y={value:.2f} for '{gate.get('name')}'")
+                            
+                            print(f"      ✓ Rendered quadrant gate '{gate.get('name')}' with {len(dividers)} divider(s), color: {line_color}")
+                        else:
+                            print(f"      ⚠️  Skipped '{gate.get('name')}': no dividers found")
+                    
+                    # Handle polygon/rectangle gates
                     else:
-                        print(f"      ⚠️  Skipped '{gate.get('name')}': invalid coordinates")
+                        xs = gate.get('xs', [])
+                        ys = gate.get('ys', [])
+                        if xs and ys and len(xs) == len(ys) and len(xs) >= 3:
+                            # Swap if dimensions are reversed
+                            if gate.get('x_dim') == y_channel:
+                                xs, ys = ys, xs
+
+                            print(f"      DEBUG: Gate '{gate.get('name')}' coordinates:")
+                            print(f"             X: [{min(xs):.2f}, {max(xs):.2f}]")
+                            print(f"             Y: [{min(ys):.2f}, {max(ys):.2f}]")
+
+                            # Ensure polygon is closed
+                            if xs[0] != xs[-1] or ys[0] != ys[-1]:
+                                xs = list(xs) + [xs[0]]
+                                ys = list(ys) + [ys[0]]
+
+                            # Get color for this gate
+                            fill_color, line_color = gate_colors[gate_idx % len(gate_colors)]
+
+                            # Plot gates with distinct colors (no legend_label - will add global legend)
+                            # Gates are already in raw data space from inverse transform
+                            # They will be displayed correctly on log-scale axes
+                            p.patch(xs, ys, fill_color=fill_color, fill_alpha=0.3, line_color=line_color,
+                                   line_width=2.5, line_alpha=0.9)
+                            print(f"      ✓ Rendered '{gate.get('name')}' ({len(xs)} vertices, color: {fill_color})")
+                        else:
+                            print(f"      ⚠️  Skipped '{gate.get('name')}': invalid coordinates")
                 else:
                     print(f"      ⚠️  Skipped '{gate.get('name')}': channel mismatch")
         
@@ -1831,20 +2722,334 @@ class FlowAnalyzer:
             x_data = df_plot[x_channel].dropna()
             y_data = df_plot[y_channel].dropna()
             if len(x_data) > 0 and len(y_data) > 0:
+                x_min = x_data.min()
                 x_max = x_data.max()
-                y_min = y_data.min()
                 y_max = y_data.max()
-                
-                # Position in bottom right with padding
-                keyword_label = Label(x=x_max * 0.98, y=y_min + (y_max - y_min) * 0.02,
+
+                # Position in top left with padding
+                keyword_label = Label(x=x_min + (x_max - x_min) * 0.02, y=y_max * 0.98,
                                      text=keyword_text,
                                      text_font_size="8pt", text_color="black",
-                                     text_align="right", text_baseline="bottom",
+                                     text_align="left", text_baseline="top",
                                      background_fill_color="white",
                                      background_fill_alpha=0.7, border_line_color="gray",
                                      border_line_width=1, x_units="data", y_units="data")
                 p.add_layout(keyword_label)
         
+        return p
+    def _plot_contour(self, df, x_keyword, y_keyword, sample_id, gate_name, show_gates=False, gates=None, selected_gate=None, show_keywords=False, keywords=None, gate_mode='polygon', quadrant_thresholds=None):
+        """
+        Generate a contour/density plot for two channels using raw (untransformed) data.
+
+        Creates a 2D density plot with iso-density contours similar to traditional
+        flow cytometry plots (e.g., FlowJo). Uses 2D Kernel Density Estimation (KDE)
+        to calculate density and matplotlib for contour extraction, then renders
+        contours in Bokeh for interactive visualization.
+
+        The method works in log space to ensure proper density calculation for
+        log-scale axes, and renders 6 contour levels at percentiles [10, 25, 50,
+        75, 90, 95] to show population density gradients.
+
+        Args:
+            df (pd.DataFrame): DataFrame with gate events (raw data, source="raw")
+            x_keyword (str): Keyword substring to identify X-axis channel column
+                            (e.g., "FSC-A", "SSC-A", "B1-A")
+            y_keyword (str): Keyword substring to identify Y-axis channel column
+                            (e.g., "FSC-A", "SSC-A", "R2-A")
+            sample_id (str): Sample ID to include in plot title
+            gate_name (str): Gate name to include in plot title
+            show_gates (bool, optional): Whether to display gate boundaries. Defaults to False.
+            gates (list, optional): List of gate dictionaries to display. Defaults to None.
+            selected_gate (str, optional): Name of the selected gate. Defaults to None.
+            show_keywords (bool, optional): Whether to display keywords. Defaults to False.
+            keywords (dict, optional): Dictionary of keywords to display. Defaults to None.
+            gate_mode (str, optional): 'polygon' or 'quadrant'. Defaults to 'polygon'.
+            quadrant_thresholds (dict, optional): Quadrant threshold values
+                                                 {'x_threshold': float, 'y_threshold': float}.
+                                                 Defaults to None.
+
+        Returns:
+            bokeh.plotting.figure: Bokeh figure object with contour plot rendered.
+                                  Figure uses log-log axes (1 to 10⁵) matching FlowJo.
+
+        Raises:
+            ValueError: If no channel column matches either x_keyword or y_keyword.
+
+        Technical Details:
+            - Filters out values ≤ 0 for log scale compatibility
+            - Downsamples to 10,000 points maximum for KDE performance
+            - Creates 100×100 evaluation grid in log space
+            - Uses scipy.stats.gaussian_kde for 2D density estimation
+            - Uses matplotlib.pyplot.contour for contour line extraction
+            - Renders contour paths in Bokeh (matplotlib only for calculation)
+            - Supports gate overlays (quadrant dividers and polygon gates)
+            - Annotations positioned in top-left corner for visibility
+
+        Example:
+            >>> # Create contour plot for FITC vs APC channels
+            >>> df = workspace.get_gate_events("A1.fcs", "Singlets", source="raw")
+            >>> p = analyzer._plot_contour(df, "B1-A", "R2-A", "A1.fcs", "Singlets")
+
+            >>> # Create contour plot with quadrant dividers
+            >>> thresholds = {'x_threshold': 3112.94, 'y_threshold': 444.11}
+            >>> p = analyzer._plot_contour(df, "B1-A", "R2-A", "A1.fcs", "Singlets",
+            ...                           gate_mode='quadrant',
+            ...                           quadrant_thresholds=thresholds)
+
+        See Also:
+            _plot_scatter: For point-based visualization of 2D data
+            _plot_histogram: For 1D density visualization
+        """
+        from bokeh.plotting import figure
+        from scipy.stats import gaussian_kde
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        # Find matching channels
+        x_channels = [c for c in df.columns if x_keyword in c]
+        y_channels = [c for c in df.columns if y_keyword in c]
+
+        if not x_channels:
+            raise ValueError(f"No channel found matching keyword '{x_keyword}'")
+        if not y_channels:
+            raise ValueError(f"No channel found matching keyword '{y_keyword}'")
+
+        x_channel = x_channels[0]
+        y_channel = y_channels[0]
+
+        # Filter out values <= 0 for log scale
+        df_filtered = df[(df[x_channel] > 0) & (df[y_channel] > 0)]
+
+        if len(df_filtered) < 10:
+            # Not enough data points for KDE
+            print(f"    ⚠️  Warning: Only {len(df_filtered)} data points - cannot generate contours")
+            # Return empty plot with message
+            p = figure(title=f"{sample_id} - {gate_name} (Insufficient data)",
+                      x_axis_label=x_channel, y_axis_label=y_channel,
+                      x_axis_type="log", y_axis_type="log",
+                      x_range=(1, 1e5), y_range=(1, 1e5),
+                      width=400, height=300, tools="pan,wheel_zoom,box_zoom,reset,save",
+                      sizing_mode="fixed")
+            return p
+
+        # Downsample if too many points (for KDE performance)
+        max_points = 10000
+        if len(df_filtered) > max_points:
+            df_kde = df_filtered.sample(n=max_points, random_state=42)
+        else:
+            df_kde = df_filtered
+
+        # Extract data
+        x_data = df_kde[x_channel].values
+        y_data = df_kde[y_channel].values
+
+        # Work in log space (since axes are log scale)
+        log_x = np.log10(x_data)
+        log_y = np.log10(y_data)
+
+        # Create 2D KDE
+        xy = np.vstack([log_x, log_y])
+        try:
+            kde = gaussian_kde(xy)
+        except Exception as e:
+            print(f"    ⚠️  Warning: KDE calculation failed: {e}")
+            # Return empty plot
+            p = figure(title=f"{sample_id} - {gate_name} (KDE failed)",
+                      x_axis_label=x_channel, y_axis_label=y_channel,
+                      x_axis_type="log", y_axis_type="log",
+                      x_range=(1, 1e5), y_range=(1, 1e5),
+                      width=400, height=300, tools="pan,wheel_zoom,box_zoom,reset,save",
+                      sizing_mode="fixed")
+            return p
+
+        # Create evaluation grid
+        # Use 100x100 grid for smooth contours
+        grid_points = 100
+        x_grid_log = np.linspace(0, 5, grid_points)  # log10(1) to log10(100000)
+        y_grid_log = np.linspace(0, 5, grid_points)
+        X, Y = np.meshgrid(x_grid_log, y_grid_log)
+        positions = np.vstack([X.ravel(), Y.ravel()])
+
+        # Evaluate KDE on grid
+        Z = kde(positions).reshape(X.shape)
+
+        # Use matplotlib to calculate contours
+        # We'll use percentile-based levels for consistent appearance
+        sorted_density = np.sort(Z.ravel())
+        sorted_density = sorted_density[sorted_density > 0]  # Remove zeros
+
+        if len(sorted_density) == 0:
+            print(f"    ⚠️  Warning: Zero density - cannot generate contours")
+            p = figure(title=f"{sample_id} - {gate_name} (Zero density)",
+                      x_axis_label=x_channel, y_axis_label=y_channel,
+                      x_axis_type="log", y_axis_type="log",
+                      x_range=(1, 1e5), y_range=(1, 1e5),
+                      width=400, height=300, tools="pan,wheel_zoom,box_zoom,reset,save",
+                      sizing_mode="fixed")
+            return p
+
+        # Define contour levels at specific percentiles
+        # Higher percentiles = higher density = inner contours
+        percentiles = [10, 25, 50, 75, 90, 95]
+        levels = [np.percentile(sorted_density, p) for p in percentiles]
+
+        # Create matplotlib figure for contour calculation (don't display)
+        fig, ax = plt.subplots()
+        cs = ax.contour(X, Y, Z, levels=levels)
+        plt.close(fig)  # Close immediately - we just need the paths
+
+        # Create Bokeh figure
+        p = figure(title=f"{sample_id} - {gate_name}",
+                  x_axis_label=x_channel, y_axis_label=y_channel,
+                  x_axis_type="log", y_axis_type="log",
+                  x_range=(1, 1e5), y_range=(1, 1e5),
+                  width=400, height=300, tools="pan,wheel_zoom,box_zoom,reset,save",
+                  sizing_mode="fixed")
+
+        # Extract and render contour paths
+        contour_count = 0
+        for collection in cs.collections:
+            for path in collection.get_paths():
+                vertices = path.vertices
+                if len(vertices) > 0:
+                    # Convert from log space to linear space
+                    contour_x = 10 ** vertices[:, 0]
+                    contour_y = 10 ** vertices[:, 1]
+
+                    # Render contour line in Bokeh
+                    p.line(contour_x, contour_y, line_width=1.5,
+                          color='navy', alpha=0.7)
+                    contour_count += 1
+
+        print(f"    ✓ Rendered {contour_count} contour lines")
+
+        # Render quadrant dividers if in quadrant mode
+        if gate_mode == 'quadrant' and quadrant_thresholds:
+            print(f"    → Rendering quadrant dividers on log scale (1 to 10^5)")
+            from bokeh.models import Span
+
+            divider_color = "#DC143C"  # Crimson
+
+            # Render vertical divider (X threshold)
+            if 'x_threshold' in quadrant_thresholds:
+                x_thresh = quadrant_thresholds['x_threshold']
+                span = Span(location=x_thresh, dimension='height',
+                           line_color=divider_color, line_width=2.5,
+                           line_dash='dashed', line_alpha=0.9)
+                p.add_layout(span)
+                print(f"      ✓ Rendered vertical divider at x={x_thresh:.2f}")
+
+            # Render horizontal divider (Y threshold)
+            if 'y_threshold' in quadrant_thresholds:
+                y_thresh = quadrant_thresholds['y_threshold']
+                span = Span(location=y_thresh, dimension='width',
+                           line_color=divider_color, line_width=2.5,
+                           line_dash='dashed', line_alpha=0.9)
+                p.add_layout(span)
+                print(f"      ✓ Rendered horizontal divider at y={y_thresh:.2f}")
+
+        # Render gate boundaries if requested (polygon mode)
+        elif show_gates and gates:
+            print(f"    → Rendering {len(gates)} gate(s) on log scale (1 to 10^5)")
+
+            # Color palette for gates
+            gate_colors = [
+                ("#6B8E23", "#556B2F"),  # Olive green
+                ("#4682B4", "#36648B"),  # Steel blue
+                ("#CD853F", "#8B5A2B"),  # Peru/tan
+                ("#9370DB", "#7B68EE"),  # Medium purple
+                ("#DC143C", "#B22222"),  # Crimson
+                ("#20B2AA", "#008B8B"),  # Light sea green
+                ("#FF8C00", "#CD6600"),  # Dark orange
+                ("#8B4789", "#68387E"),  # Dark orchid
+            ]
+
+            from bokeh.models import Span
+
+            for gate_idx, gate in enumerate(gates):
+                if (gate.get('x_dim') == x_channel and gate.get('y_dim') == y_channel) or \
+                   (gate.get('x_dim') == y_channel and gate.get('y_dim') == x_channel):
+
+                    gate_type = gate.get('type', 'polygon')
+
+                    # Handle quadrant gates
+                    if gate_type == 'quadrant':
+                        dividers = gate.get('dividers', [])
+                        if dividers:
+                            fill_color, line_color = gate_colors[gate_idx % len(gate_colors)]
+
+                            for divider in dividers:
+                                orientation = divider.get('orientation')
+                                value = divider.get('value')
+
+                                if orientation == 'vertical' and value is not None:
+                                    span = Span(location=value, dimension='height',
+                                               line_color=line_color, line_width=2.5,
+                                               line_dash='dashed', line_alpha=0.9)
+                                    p.add_layout(span)
+                                    print(f"      ✓ Rendered vertical divider at x={value:.2f} for '{gate.get('name')}'")
+                                elif orientation == 'horizontal' and value is not None:
+                                    span = Span(location=value, dimension='width',
+                                               line_color=line_color, line_width=2.5,
+                                               line_dash='dashed', line_alpha=0.9)
+                                    p.add_layout(span)
+                                    print(f"      ✓ Rendered horizontal divider at y={value:.2f} for '{gate.get('name')}'")
+
+                            print(f"      ✓ Rendered quadrant gate '{gate.get('name')}' with {len(dividers)} divider(s), color: {line_color}")
+                        else:
+                            print(f"      ⚠️  Skipped '{gate.get('name')}': no dividers found")
+
+                    # Handle polygon/rectangle gates
+                    else:
+                        xs = gate.get('xs', [])
+                        ys = gate.get('ys', [])
+                        if xs and ys and len(xs) == len(ys) and len(xs) >= 3:
+                            # Swap if dimensions are reversed
+                            if gate.get('x_dim') == y_channel:
+                                xs, ys = ys, xs
+
+                            print(f"      DEBUG: Gate '{gate.get('name')}' coordinates:")
+                            print(f"             X: [{min(xs):.2f}, {max(xs):.2f}]")
+                            print(f"             Y: [{min(ys):.2f}, {max(ys):.2f}]")
+
+                            # Ensure polygon is closed
+                            if xs[0] != xs[-1] or ys[0] != ys[-1]:
+                                xs = list(xs) + [xs[0]]
+                                ys = list(ys) + [ys[0]]
+
+                            fill_color, line_color = gate_colors[gate_idx % len(gate_colors)]
+
+                            p.patch(xs, ys, fill_color=fill_color, fill_alpha=0.3, line_color=line_color,
+                                   line_width=2.5, line_alpha=0.9)
+                            print(f"      ✓ Rendered '{gate.get('name')}' ({len(xs)} vertices, color: {fill_color})")
+                        else:
+                            print(f"      ⚠️  Skipped '{gate.get('name')}': invalid coordinates")
+                else:
+                    print(f"      ⚠️  Skipped '{gate.get('name')}': channel mismatch")
+
+        # Add keyword display in top left if requested
+        if show_keywords and keywords:
+            from bokeh.models import Label
+            keyword_lines = []
+            for key, value in keywords.items():
+                keyword_lines.append(f"{key}: {value}")
+            keyword_text = "\n".join(keyword_lines)
+
+            # Get plot dimensions for positioning
+            x_min = x_data.min()
+            x_max = x_data.max()
+            y_max = y_data.max()
+
+            # Position in top left with padding
+            keyword_label = Label(x=x_min + (x_max - x_min) * 0.02, y=y_max * 0.98,
+                                 text=keyword_text,
+                                 text_font_size="8pt", text_color="black",
+                                 text_align="left", text_baseline="top",
+                                 background_fill_color="white",
+                                 background_fill_alpha=0.7, border_line_color="gray",
+                                 border_line_width=1, x_units="data", y_units="data")
+            p.add_layout(keyword_label)
+
         return p
 
     def generate_interactive_plots(self, selections, output_path):
@@ -1978,54 +3183,78 @@ class FlowAnalyzer:
                         print(f"    ✓ Found well ID: {r}{c:02d} (extracted from {method_used})")
                     
                     # Get gate events with raw data
-                    # IMPORTANT: Load PRE-FILTERED data (parent gate), not the selected gate's data
-                    # This allows us to visualize the gate boundary overlaid on ungated/parent populations
-                    print(f"    → Loading PRE-FILTERED data (before '{gate_name}' gate)...", end=" ")
-                    if gate_name == "Ungated" or (not gate_path or gate_path == ()):
-                        # Ungated case - use raw events
-                        events = sample.get_events(source='raw')
-                        if events is not None:
-                            # Convert to DataFrame if needed
-                            if not isinstance(events, pd.DataFrame):
-                                df = pd.DataFrame(events, columns=sample.pnn_labels)
-                            else:
-                                df = events
-                        else:
-                            df = None
-                    elif gate_path == ('root',):
-                        # First-level gate (like Cells_withDebris) - parent is raw ungated data
-                        events = sample.get_events(source='raw')
-                        if events is not None:
-                            if not isinstance(events, pd.DataFrame):
-                                df = pd.DataFrame(events, columns=sample.pnn_labels)
-                            else:
-                                df = events
-                        else:
-                            df = None
-                    else:
-                        # Multi-level gate - get parent gate's data
-                        parent_gate_path = gate_path[:-1]
-                        # Get the parent gate name from the workspace
-                        try:
-                            # Navigate to parent gate
-                            if parent_gate_path == ('root',):
-                                # Parent is a root-level gate, need to find it by name
-                                # For now, use raw events as fallback
-                                events = sample.get_events(source='raw')
-                                if events is not None:
-                                    if not isinstance(events, pd.DataFrame):
-                                        df = pd.DataFrame(events, columns=sample.pnn_labels)
-                                    else:
-                                        df = events
+                    # Check if we should use the selected gate's data directly (when "use parent gate" option was selected)
+                    use_gate_directly = plot_config.get('use_gate_data_directly', False)
+                    
+                    if use_gate_directly:
+                        # Use the selected gate's data directly (for visualizing child gates on top)
+                        print(f"    → Loading data from gate '{gate_name}'...", end=" ")
+                        if gate_name == "Ungated" or (not gate_path or gate_path == ()):
+                            # Ungated case - use raw events
+                            events = sample.get_events(source='raw')
+                            if events is not None:
+                                if not isinstance(events, pd.DataFrame):
+                                    df = pd.DataFrame(events, columns=sample.pnn_labels)
                                 else:
-                                    df = None
+                                    df = events
                             else:
-                                # Use the parent path to get parent gate events
-                                parent_gate_name = parent_gate_path[-1]
-                                df = self.workspace.get_gate_events(sample_id, parent_gate_name, gate_path=parent_gate_path, source="raw")
-                        except Exception as e:
-                            print(f"\n    ⚠️  Could not load parent gate data: {e}")
-                            df = None
+                                df = None
+                        else:
+                            # Get the selected gate's events directly
+                            try:
+                                df = self.workspace.get_gate_events(sample_id, gate_name, gate_path=gate_path, source="raw")
+                            except Exception as e:
+                                print(f"\n    ⚠️  Could not load gate data: {e}")
+                                df = None
+                    else:
+                        # IMPORTANT: Load PRE-FILTERED data (parent gate), not the selected gate's data
+                        # This allows us to visualize the gate boundary overlaid on ungated/parent populations
+                        print(f"    → Loading PRE-FILTERED data (before '{gate_name}' gate)...", end=" ")
+                        if gate_name == "Ungated" or (not gate_path or gate_path == ()):
+                            # Ungated case - use raw events
+                            events = sample.get_events(source='raw')
+                            if events is not None:
+                                # Convert to DataFrame if needed
+                                if not isinstance(events, pd.DataFrame):
+                                    df = pd.DataFrame(events, columns=sample.pnn_labels)
+                                else:
+                                    df = events
+                            else:
+                                df = None
+                        elif gate_path == ('root',):
+                            # First-level gate (like Cells_withDebris) - parent is raw ungated data
+                            events = sample.get_events(source='raw')
+                            if events is not None:
+                                if not isinstance(events, pd.DataFrame):
+                                    df = pd.DataFrame(events, columns=sample.pnn_labels)
+                                else:
+                                    df = events
+                            else:
+                                df = None
+                        else:
+                            # Multi-level gate - get parent gate's data
+                            parent_gate_path = gate_path[:-1]
+                            # Get the parent gate name from the workspace
+                            try:
+                                # Navigate to parent gate
+                                if parent_gate_path == ('root',):
+                                    # Parent is a root-level gate, need to find it by name
+                                    # For now, use raw events as fallback
+                                    events = sample.get_events(source='raw')
+                                    if events is not None:
+                                        if not isinstance(events, pd.DataFrame):
+                                            df = pd.DataFrame(events, columns=sample.pnn_labels)
+                                        else:
+                                            df = events
+                                    else:
+                                        df = None
+                                else:
+                                    # Use the parent path to get parent gate events
+                                    parent_gate_name = parent_gate_path[-1]
+                                    df = self.workspace.get_gate_events(sample_id, parent_gate_name, gate_path=parent_gate_path, source="raw")
+                            except Exception as e:
+                                print(f"\n    ⚠️  Could not load parent gate data: {e}")
+                                df = None
                     
                     if df is None or df.empty:
                         print("SKIPPED")
@@ -2123,10 +3352,41 @@ class FlowAnalyzer:
                                         selected_gate_data = self._extract_selected_gate(sample_id, gate_name, gate_path, x_channel, y_channel)
                                         if selected_gate_data:
                                             gates_for_viz.append(selected_gate_data)
-                                            print(f"      ✓ Extracted '{gate_name}' (selected gate, {len(selected_gate_data['xs'])} vertices)")
+                                            # Handle different gate types in logging
+                                            if selected_gate_data.get('type') == 'quadrant':
+                                                num_dividers = len(selected_gate_data.get('dividers', []))
+                                                print(f"      ✓ Extracted '{gate_name}' (selected gate, quadrant with {num_dividers} divider(s))")
+                                            else:
+                                                num_vertices = len(selected_gate_data.get('xs', []))
+                                                print(f"      ✓ Extracted '{gate_name}' (selected gate, {num_vertices} vertices)")
                                         else:
                                             print(f"      ⚠️  Failed to extract selected gate '{gate_name}' (returned None)")
                                             print(f"         Check warnings above for details")
+                                    
+                                    # Extract child gates of the selected gate (e.g., Q1-Q4 quadrants under Singlets)
+                                    # Child gates have a path that starts with the selected gate's path + gate name
+                                    if gate_path:
+                                        child_gate_path_prefix = gate_path + (gate_name,)
+                                        print(f"      → Looking for child gates under '{gate_name}' (path prefix: {' → '.join(child_gate_path_prefix)})")
+                                        all_gate_ids = self.workspace.get_gate_ids(sample_id)
+                                        for child_gate_name, child_gate_path in all_gate_ids:
+                                            # Check if this is a child of the selected gate
+                                            # Child path should be longer and start with parent path + parent name
+                                            if (len(child_gate_path) > len(child_gate_path_prefix) and 
+                                                child_gate_path[:len(child_gate_path_prefix)] == child_gate_path_prefix):
+                                                # This is a child gate - try to extract it if it matches channels
+                                                if child_gate_name in gates_to_viz_list or 'all' in gates_to_viz_list:
+                                                    child_gate_data = self._extract_selected_gate(sample_id, child_gate_name, child_gate_path, x_channel, y_channel)
+                                                    if child_gate_data:
+                                                        # Avoid duplicates
+                                                        if not any(g['name'] == child_gate_data['name'] for g in gates_for_viz):
+                                                            gates_for_viz.append(child_gate_data)
+                                                            if child_gate_data.get('type') == 'quadrant':
+                                                                num_dividers = len(child_gate_data.get('dividers', []))
+                                                                print(f"      ✓ Extracted child gate '{child_gate_name}' (quadrant with {num_dividers} divider(s))")
+                                                            else:
+                                                                num_vertices = len(child_gate_data.get('xs', []))
+                                                                print(f"      ✓ Extracted child gate '{child_gate_name}' ({num_vertices} vertices)")
 
                                     # Also extract any other gates from the workspace
                                     all_gates = self._extract_gate_polygons(sample_id, x_channel, y_channel)
@@ -2135,7 +3395,13 @@ class FlowAnalyzer:
                                             # Avoid duplicates
                                             if not any(g['name'] == gate_data['name'] for g in gates_for_viz):
                                                 gates_for_viz.append(gate_data)
-                                                print(f"      ✓ Extracted '{gate_data['name']}' ({len(gate_data['xs'])} vertices)")
+                                                # Handle different gate types in logging
+                                                if gate_data.get('type') == 'quadrant':
+                                                    num_dividers = len(gate_data.get('dividers', []))
+                                                    print(f"      ✓ Extracted '{gate_data['name']}' (quadrant with {num_dividers} divider(s))")
+                                                else:
+                                                    num_vertices = len(gate_data.get('xs', []))
+                                                    print(f"      ✓ Extracted '{gate_data['name']}' ({num_vertices} vertices)")
 
                                     if not gates_for_viz:
                                         print(f"      ⚠️  Could not extract any of the requested gates")
@@ -2154,13 +3420,34 @@ class FlowAnalyzer:
                                                show_keywords=show_keywords, keywords=keywords)
                         # Shortened title - just well ID and gate name
                         p.title.text = f"{well_id} - {gate_name}"
-                    else:  # scatter
+                    elif plot_type == "scatter":
+                        # Get gate_mode and quadrant_thresholds from plot_config
+                        plot_gate_mode = plot_config.get('gate_mode', 'polygon')
+                        plot_quadrant_thresholds = plot_config.get('quadrant_thresholds', None)
+
                         # Pass the extracted gates for visualization
                         plot_show_gates = len(gates_for_viz) > 0
                         p = self._plot_scatter(df, parameters[0], parameters[1], well_id, gate_name,
                                              gates=gates_for_viz, show_gates=plot_show_gates,
                                              selected_gate=None,  # Not using selected_gate anymore
-                                             keywords=keywords, show_keywords=show_keywords)
+                                             keywords=keywords, show_keywords=show_keywords,
+                                             gate_mode=plot_gate_mode,
+                                             quadrant_thresholds=plot_quadrant_thresholds)
+                        # Shortened title - just well ID and gate name
+                        p.title.text = f"{well_id} - {gate_name}"
+                    else:  # contour
+                        # Get gate_mode and quadrant_thresholds from plot_config
+                        plot_gate_mode = plot_config.get('gate_mode', 'polygon')
+                        plot_quadrant_thresholds = plot_config.get('quadrant_thresholds', None)
+
+                        # Pass the extracted gates for visualization
+                        plot_show_gates = len(gates_for_viz) > 0
+                        p = self._plot_contour(df, parameters[0], parameters[1], well_id, gate_name,
+                                             gates=gates_for_viz, show_gates=plot_show_gates,
+                                             selected_gate=None,
+                                             keywords=keywords, show_keywords=show_keywords,
+                                             gate_mode=plot_gate_mode,
+                                             quadrant_thresholds=plot_quadrant_thresholds)
                         # Shortened title - just well ID and gate name
                         p.title.text = f"{well_id} - {gate_name}"
                     
@@ -2489,12 +3776,17 @@ def main():
     """
     Main entry point for the FlowJo Analysis Tool.
     
-    Interactive plotting mode only - prompts user for gate selection, plot type, and parameters,
-    then generates plots for all samples and saves to HTML.
+    Supports two modes:
+    - Interactive plotting mode: prompts user for gate selection, plot type, and parameters
+    - Inspect mode: displays gate hierarchy without generating plots
     
     Examples:
         # Interactive plotting
         python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs --interactive
+        
+        # Inspect gates
+        python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs --inspect
+        python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs --inspect --sample sample1.fcs
     """
     args = parse_args()
     
@@ -2502,58 +3794,71 @@ def main():
         print(f"Error: Workspace file not found at {args.wsp}")
         sys.exit(1)
     
-    if not args.interactive:
-        print("Error: Interactive mode is required. Use --interactive flag.")
-        print("Usage: python analyze_flow.py --wsp <workspace.wsp> --fcs_dir <fcs_dir> --interactive")
+    # Check that exactly one mode is selected
+    if args.interactive and args.inspect:
+        print("Error: Cannot use both --interactive and --inspect. Choose one mode.")
         sys.exit(1)
-        
-    analyzer = FlowAnalyzer(args.wsp, args.fcs_dir)
     
-    # Interactive plotting mode
-    # Prompts user for gate selection, plot type, and parameters
-    # Then generates plots for all samples and saves to HTML
-    selections = analyzer.interactive_plot_prompt()
-    if selections:
-        # Generate output filename based on input name + type + parameters + keyword filter
-        base_name = os.path.splitext(os.path.basename(args.wsp))[0]
-        
-        # Get plot configs (new format) or use old format for backward compatibility
-        plot_configs = selections.get('plot_configs', [])
-        if not plot_configs:
-            # Old format - create a single plot config
-            plot_configs = [{
-                'plot_type': selections.get('plot_type', 'histogram'),
-                'gate_name': selections.get('gate_name', 'Ungated'),
-                'parameters': selections.get('parameters', [])
-            }]
-        
-        # Use first plot config for filename (or combine all if multiple)
-        if len(plot_configs) == 1:
-            plot_type = plot_configs[0]['plot_type']
-            gate_name = plot_configs[0]['gate_name'].replace(' ', '_').replace('/', '_')
-            params_str = '_'.join(plot_configs[0]['parameters']).replace(' ', '_').replace('/', '_')
-        else:
-            # Multiple plots - use generic name
-            plot_type = 'multi'
-            gate_name = 'multi'
-            params_str = f"{len(plot_configs)}plots"
-        
-        # Add keyword filter to filename if present
-        filter_str = ""
-        if 'keyword_filter' in selections:
-            kf = selections['keyword_filter']
-            key_clean = kf['key'].replace(' ', '_').replace('/', '_').replace('(', '').replace(')', '')
-            value_clean = str(kf['value']).replace(' ', '_').replace('/', '_')
-            filter_str = f"_{key_clean}_{value_clean}"
-        
-        if args.output != "report.html":
-            output_path = args.output
-        else:
-            output_path = f"{base_name}_{plot_type}_{gate_name}_{params_str}{filter_str}.html"
-        
-        analyzer.generate_interactive_plots(selections, output_path)
+    if not args.interactive and not args.inspect:
+        print("Error: Must specify either --interactive or --inspect mode.")
+        print("Usage:")
+        print("  Interactive mode: python analyze_flow.py --wsp <workspace.wsp> --fcs_dir <fcs_dir> --interactive")
+        print("  Inspect mode:     python analyze_flow.py --wsp <workspace.wsp> --fcs_dir <fcs_dir> --inspect")
+        sys.exit(1)
+    
+    if args.inspect:
+        # Inspect mode - display gate hierarchy
+        # Import here to avoid circular dependencies
+        from inspect_gates import inspect_gates
+        inspect_gates(args.wsp, args.fcs_dir, args.sample)
     else:
-        print("No selections made. Exiting.")
+        # Interactive plotting mode
+        analyzer = FlowAnalyzer(args.wsp, args.fcs_dir)
+        
+        # Prompts user for gate selection, plot type, and parameters
+        # Then generates plots for all samples and saves to HTML
+        selections = analyzer.interactive_plot_prompt()
+        if selections:
+            # Generate output filename based on input name + type + parameters + keyword filter
+            base_name = os.path.splitext(os.path.basename(args.wsp))[0]
+            
+            # Get plot configs (new format) or use old format for backward compatibility
+            plot_configs = selections.get('plot_configs', [])
+            if not plot_configs:
+                # Old format - create a single plot config
+                plot_configs = [{
+                    'plot_type': selections.get('plot_type', 'histogram'),
+                    'gate_name': selections.get('gate_name', 'Ungated'),
+                    'parameters': selections.get('parameters', [])
+                }]
+            
+            # Use first plot config for filename (or combine all if multiple)
+            if len(plot_configs) == 1:
+                plot_type = plot_configs[0]['plot_type']
+                gate_name = plot_configs[0]['gate_name'].replace(' ', '_').replace('/', '_')
+                params_str = '_'.join(plot_configs[0]['parameters']).replace(' ', '_').replace('/', '_')
+            else:
+                # Multiple plots - use generic name
+                plot_type = 'multi'
+                gate_name = 'multi'
+                params_str = f"{len(plot_configs)}plots"
+            
+            # Add keyword filter to filename if present
+            filter_str = ""
+            if 'keyword_filter' in selections:
+                kf = selections['keyword_filter']
+                key_clean = kf['key'].replace(' ', '_').replace('/', '_').replace('(', '').replace(')', '')
+                value_clean = str(kf['value']).replace(' ', '_').replace('/', '_')
+                filter_str = f"_{key_clean}_{value_clean}"
+            
+            if args.output != "report.html":
+                output_path = args.output
+            else:
+                output_path = f"{base_name}_{plot_type}_{gate_name}_{params_str}{filter_str}.html"
+            
+            analyzer.generate_interactive_plots(selections, output_path)
+        else:
+            print("No selections made. Exiting.")
 
 if __name__ == "__main__":
     main()

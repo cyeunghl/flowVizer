@@ -6,9 +6,10 @@ Python-based tools for FlowJo workspace analysis with interactive HTML visualiza
 
 flowViz analyzes FlowJo workspaces and associated FCS files to generate interactive HTML plots organized in a 96-well plate grid. It leverages `flowkit` for parsing flow cytometry data and `bokeh` for creating interactive visualizations. All visualizations use raw (untransformed) data values for accuracy.
 
-**Two modes of operation:**
-1. **Interactive Mode** (`analyze_flow.py`): CLI-guided plot generation with manual configuration
-2. **Batch Mode** (`batch_analyze_flow.py`): Automated processing for time series, dose-response, and replicate analysis
+**Three modes of operation:**
+1. **Interactive Mode** (`analyze_flow.py --interactive`): CLI-guided plot generation with manual configuration
+2. **Inspect Mode** (`analyze_flow.py --inspect`): Display gate hierarchy and gate information without generating plots
+3. **Batch Mode** (`batch_analyze_flow.py`): Automated processing for time series, dose-response, and replicate analysis
 
 ## Quick Start
 
@@ -21,6 +22,11 @@ python batch_analyze_flow.py
 **For manual/exploratory analysis:**
 ```bash
 python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --interactive
+```
+
+**For inspecting gate structure:**
+```bash
+python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --inspect
 ```
 
 ## Documentation
@@ -39,10 +45,13 @@ python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --interactive
 - **Interactive HTML Output**: Pan, zoom, and explore plots in your web browser
 - **Flexible Well ID Extraction**: Auto-detect well IDs from keywords, filenames, or manual selection
 - **Gate Visualization**: Display gate boundaries on scatter plots with distinct colors
+- **Quadrant Gate Support**: Visualize quadrant gates as divider lines
 - **Multiple Plot Types**:
   - **Histograms**: Density plots (KDE) with linear or log scale
   - **Scatter Plots**: 2D parameter visualization with optional gate overlays
+  - **Contour Plots**: Iso-density contours similar to traditional flow cytometry plots (NEW!)
 - **Statistics Display**: Show event counts, median, and/or mean values on plots
+- **Smart Annotation Positioning**: Annotations automatically positioned in top-left corner for better visibility (NEW!)
 - **Keyword Filtering**: Filter samples by metadata keywords (e.g., time points)
 - **Multiple Plot Configurations**: Generate multiple plot types in separate tabs
 
@@ -56,10 +65,12 @@ Install the required Python packages:
 pip install flowkit bokeh pandas numpy scipy
 ```
 
-Optional (for gate filtering):
+**Required for contour plots:**
 ```bash
 pip install matplotlib
 ```
+
+**Note**: Matplotlib is required for contour plot generation (used for density calculations). It's optional if you only use histogram and scatter plots.
 
 ### Requirements
 
@@ -79,11 +90,16 @@ python analyze_flow.py --wsp <path_to_workspace.wsp> --fcs_dir <path_to_fcs_file
 
 - `--wsp` (required): Path to the FlowJo workspace (.wsp) file
 - `--fcs_dir` (optional): Directory containing FCS files. If not specified, uses the workspace directory
-- `--interactive` (required): Run in interactive plotting mode
-- `--output` (optional): Custom output HTML filename. If not specified, auto-generates based on plot configuration
+- `--interactive` (optional): Run in interactive plotting mode (mutually exclusive with `--inspect`)
+- `--inspect` (optional): Run in inspect mode to view gate hierarchy (mutually exclusive with `--interactive`)
+- `--sample` (optional, inspect mode only): Specific sample ID to inspect. If not specified, uses first sample
+- `--output` (optional, interactive mode only): Custom output HTML filename. If not specified, auto-generates based on plot configuration
+
+**Note**: Either `--interactive` or `--inspect` must be specified, but not both.
 
 ### Examples
 
+**Interactive Mode:**
 ```bash
 # Basic usage with auto-generated output filename
 python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --interactive
@@ -93,6 +109,109 @@ python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --interactive -
 
 # FCS files in same directory as workspace
 python analyze_flow.py --wsp /path/to/workspace.wsp --interactive
+```
+
+**Inspect Mode:**
+```bash
+# Inspect all gates in workspace (uses first sample)
+python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --inspect
+
+# Inspect gates for a specific sample
+python analyze_flow.py --wsp workspace.wsp --fcs_dir ./fcs_files --inspect --sample sample1.fcs
+
+# FCS files in same directory as workspace
+python analyze_flow.py --wsp /path/to/workspace.wsp --inspect
+```
+
+## Inspect Mode
+
+The inspect mode displays the gate hierarchy and gate information without generating plots. This is useful for:
+- Understanding the gating structure before plotting
+- Identifying available gates and their types
+- Finding gate dimensions and channel combinations
+- Debugging gate extraction issues
+
+### Inspect Mode Output
+
+The inspect mode displays:
+
+1. **Gate Hierarchy**: All gates organized by hierarchical path
+   - Shows gate names, types, dimensions, and vertex counts
+   - Displays gates in tree structure (root → parent → child)
+
+2. **Gate Details**:
+   - **Gate Type**: polygon, rectangle, quadrant, 1D, or unknown
+   - **Dimensions**: Channel names (e.g., "FSC-A × SSC-A")
+   - **Vertices**: Number of vertices for polygon gates
+   - **Dividers**: For quadrant gates, shows divider information
+
+3. **Summary Statistics**:
+   - Total number of gates
+   - Number of gate paths
+   - Gates grouped by type
+   - Gates grouped by dimension count
+
+4. **Available Channels**: Lists all channels available in the sample data
+
+### Example Inspect Output
+
+```
+Gate Hierarchy:
+================================================================================
+
+Path: root
+  Number of gates: 2
+
+  Gate: 'Ungated'
+    Type: ungated
+    Dimensions: (Ungated - all channels)
+
+  Gate: 'Cells'
+    Type: polygon
+    Dimensions (2D): FSC-A × SSC-A
+    Vertices: 4
+
+Path: root → Cells
+  Number of gates: 1
+
+  Gate: 'Singlets'
+    Type: polygon
+    Dimensions (2D): FSC-A × SSC-A
+    Vertices: 4
+
+Path: root → Cells → Singlets
+  Number of gates: 4
+
+  Gate: 'Q1: FITC-A- , APC-Vio770-A+'
+    Type: quadrant
+    Dimensions (2D): B1-A × R2-A
+
+  Gate: 'Q2: FITC-A+ , APC-Vio770-A+'
+    Type: quadrant
+    Dimensions (2D): B1-A × R2-A
+
+  Gate: 'Q3: FITC-A+ , APC-Vio770-A-'
+    Type: quadrant
+    Dimensions (2D): B1-A × R2-A
+
+  Gate: 'Q4: FITC-A- , APC-Vio770-A-'
+    Type: quadrant
+    Dimensions (2D): B1-A × R2-A
+
+Summary Statistics
+================================================================================
+
+Total gates: 7
+Number of gate paths: 3
+
+Gates by type:
+  polygon: 2
+  quadrant: 4
+  ungated: 1
+
+Gates by dimension count:
+  Ungated: 1
+  2D: 6
 ```
 
 ## Interactive Workflow
@@ -131,6 +250,9 @@ The script validates extraction and lists all matched well IDs. If no well IDs a
 ### 6. Gate Selection
 - Select gate path from available gating hierarchies
 - Select specific gate name within that path
+- **Use Parent Gate Option**: When selecting a gate path with children, option "0" allows you to use the parent gate for data filtering without further gating
+  - Example: Select path "root → Cells → Singlets", then choose "0" to use "Singlets" gate data
+  - This allows visualizing child gates (e.g., Q1-Q4 quadrants) on top of the parent population
 - "Ungated" option available for all events
 
 ### 7. Plot Configuration
@@ -149,11 +271,27 @@ For each plot configuration:
 #### Scatter Plots
 - Select X-axis channel (e.g., "FSC-A")
 - Select Y-axis channel (e.g., "SSC-A")
+- Displays individual data points (downsampled to 10,000 points for performance)
+- Log-log scale axes (1 to 10⁵) matching FlowJo defaults
+
+#### Contour Plots (NEW!)
+- Select X-axis channel (e.g., "B1-A" for FITC-A)
+- Select Y-axis channel (e.g., "R2-A" for APC-Vio770-A)
+- Displays iso-density contours similar to traditional flow cytometry plots
+- Uses 2D Kernel Density Estimation (KDE) for smooth density calculation
+- 6 contour levels at percentiles [10, 25, 50, 75, 90, 95]
+- Log-log scale axes (1 to 10⁵) matching FlowJo defaults
+- Perfect for visualizing cell population density distributions
 - **Gate Visualization** (optional):
   - Shows available gates matching the selected channels
+  - Automatically includes child gates of the selected parent gate (e.g., Q1-Q4 quadrants)
   - Choose to display gate boundaries
-  - Selected gate (used for filtering) is automatically plotted in olive green
+  - **Gate Types**:
+    - **Polygon/Rectangle gates**: Displayed as filled polygons with semi-transparent fill
+    - **Quadrant gates**: Displayed as dashed divider lines (vertical/horizontal)
+  - Selected gate (used for filtering) is automatically plotted
   - Additional gates can be displayed if enabled
+  - Can select "all" to visualize all matching gates, or specific gates by number
 
 ### 8. Output Generation
 - Processes all samples matching filter criteria
@@ -204,10 +342,17 @@ If `--output` is specified, that filename is used instead.
 
 ### Gate Visualization
 
-- **Selected Gate**: Automatically plotted on scatter plots in olive green
+- **Selected Gate**: Automatically plotted on scatter plots
 - **Additional Gates**: Can be enabled to show all gates matching the plot channels
+- **Child Gates**: When a parent gate is selected, child gates (e.g., Q1-Q4 quadrants) are automatically discovered and available for visualization
 - **Gate Matching**: Only gates matching the X/Y channel dimensions are displayed
-- **Polygon Rendering**: Gates displayed as filled polygons with semi-transparent fill
+- **Gate Types**:
+  - **Polygon/Rectangle Gates**: Displayed as filled polygons with semi-transparent fill and colored borders
+  - **Quadrant Gates**: Displayed as dashed divider lines spanning the full plot extent
+    - Vertical dividers: Lines at specific X values
+    - Horizontal dividers: Lines at specific Y values
+    - No fill or clipping regions
+- **Color Palette**: Distinct colors for each gate type (olive green, steel blue, peru, purple, crimson, etc.)
 
 ### Statistics Display
 
@@ -235,8 +380,10 @@ Generate multiple plot types in a single session:
 
 - **Raw Data**: All plots use raw (untransformed) event data
 - **Outlier Filtering**: IQR-based filtering (3×IQR) for better visualization
-- **Value Filtering**: Values < 10 filtered out for histograms (prevents log transform issues)
-- **Downsampling**: Scatter plots automatically downsample to 10,000 points if dataset is larger
+- **Value Filtering**: Values ≤ 0 filtered out for log scale plots (prevents log transform issues)
+- **Downsampling**:
+  - Scatter plots: automatically downsample to 10,000 points if dataset is larger
+  - Contour plots: downsample to 10,000 points for KDE calculation if dataset is larger
 
 ### Well ID Parsing
 
@@ -246,9 +393,14 @@ Generate multiple plot types in a single session:
 
 ### Gate Extraction
 
-- Supports polygon and rectangle gates
+- Supports multiple gate types:
+  - **Polygon gates**: Extracted from vertex coordinates
+  - **Rectangle gates**: Created from min/max bounds
+  - **Quadrant gates**: Extracted from divider positions (X and/or Y values)
 - Automatically handles dimension swapping
 - Closes polygon loops for proper rendering
+- Converts gate coordinates from FlowJo display space (0-1 normalized) to raw data space
+- Quadrant gates return divider metadata (not vertices) for line rendering
 
 ## Troubleshooting
 
@@ -263,6 +415,8 @@ Generate multiple plot types in a single session:
 - Verify gate dimensions match the selected X/Y channels
 - Check that gate is 2D (not 1D)
 - Ensure "Show gates" option is enabled for scatter plots
+- For quadrant gates: Verify dividers are extracted correctly (check debug output)
+- Child gates: Ensure parent gate is selected and child gates match plot channels
 
 **Empty plots**:
 - Check that gate contains events
